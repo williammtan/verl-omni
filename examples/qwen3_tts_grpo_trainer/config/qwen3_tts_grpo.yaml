@@ -1,0 +1,117 @@
+# Qwen3-TTS GRPO training config (FSDP actor + vLLM-Omni AR rollout, reward on decoded audio).
+#
+# Inherits verl's default ppo_trainer config and overrides the recipe-specific fields below.
+# Volatile values (data/model paths, GPU/node counts, the vLLM-Omni stage config path) are set
+# via CLI in the run script.
+#
+# Mirrors examples/gspo_trainer/config/qwen3_omni_thinker_gspo.yaml, but INVERTS what is trained:
+# GSPO trains the Thinker and excludes the talker; here we train the **talker / codec head** and
+# freeze the rest, and the reward scores the **decoded waveform** (TTSRewardManager).
+#
+# Launch with:
+#   python3 -m verl.trainer.main_ppo \
+#     --config-path=<this dir> --config-name=qwen3_tts_grpo <CLI overrides>
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_batch_size: 32        # prompts per step (global); each gets rollout.n samples
+  max_prompt_length: 512      # CX-rep lines are short (p95 ~327 chars)
+  max_response_length: 2048   # codec tokens (~Base max_new_tokens); 12Hz → ~170s ceiling
+  filter_overlong_prompts: true
+  truncation: left
+
+actor_rollout_ref:
+
+  model:
+    override_config:
+      attn_implementation: sdpa
+    # Train ONLY the talker (codec_0 main path) + codec head; freeze sub-talker (codes 1-15),
+    # speaker_encoder and code2wav. We use full-FT of the talker submodule (no LoRA for v1) via
+    # the model patch's freeze hints; flip to LoRA by setting lora_rank>0 + target/exclude.
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+
+  actor:
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: 10
+      weight_decay: 0.0
+      clip_grad: 1.0
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 4
+    use_kl_loss: true
+    kl_loss_coef: 0.04          # whiplash beta
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    strategy: fsdp
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+      model_dtype: bf16
+      use_orig_params: true
+      wrap_policy:
+        min_num_params: 100000000
+    policy_loss:
+      loss_mode: gspo           # token-level clip-higher; matches whiplash DAPO/GRPO loss family
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.3        # clip-higher (whiplash schedule end)
+    loss_agg_mode: seq-mean-token-mean
+
+  rollout:
+    name: vllm_omni
+    mode: async
+    n: 8                        # g: rollouts per prompt (whiplash g=8)
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    tensor_model_parallel_size: 4
+    calculate_log_probs: true   # REQUIRE talker codec-token logprobs (Phase-0 gate)
+    load_format: safetensors
+    layered_summon: true
+    log_prob_micro_batch_size_per_gpu: 4
+    engine_kwargs:
+      vllm_omni:
+        output_mode: ar
+        # stage_configs_path is set on the CLI (qwen3_tts_stages.yaml).
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 4
+    strategy: fsdp
+    fsdp_config:
+      param_offload: true
+      model_dtype: bf16
+      use_orig_params: true
+      wrap_policy:
+        min_num_params: 100000000
+
+algorithm:
+  adv_estimator: grpo           # per-group z-score of the fused TTS reward
+  use_kl_in_reward: false
+
+reward:
+  reward_manager:
+    name: TTSRewardManager
+  tts:                          # consumed by TTSRewardManager
+    w_text: 1.0                 # intelligibility (-CER)
+    w_sim: 1.0                  # speaker similarity vs the clone ref
+    w_mos: 1.0                  # UTMOSv2 naturalness MOS
+    w_stab: 1.0                 # truncation/repetition/outlier/synth-fail penalty
+
+trainer:
+  val_before_train: false
+  critic_warmup: 0
+  logger: ["console", "mlflow"]
+  project_name: qwen3_tts_grpo
+  experiment_name: tts_grpo_voice_synth
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: 20
+  test_freq: 0
+  total_epochs: 1

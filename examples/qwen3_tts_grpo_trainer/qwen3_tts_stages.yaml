@@ -1,0 +1,76 @@
+# vLLM-Omni stage config for Qwen3-TTS RL rollout (talker → code2wav).
+#
+# Two stages: AR talker (codec generation, gradient-bearing logprobs) → code2wav (decode to
+# 24kHz audio, the reward input). Uses the verl-omni `stage_args`/`engine_args` schema (as in
+# examples/gspo_trainer/qwen3_omni_thinker_only.yaml), with engine_args derived from vLLM-Omni's
+# canonical deploy config (vllm_omni/deploy/qwen3_tts.yaml).
+#
+# ⚠️ PHASE-0 VALIDATE ON-CLUSTER: the exact stage field names (model_arch / model_stage /
+# scheduler_cls / engine_output_type / hf_config_name) and whether the talker surfaces
+# processed logprobs through verl's async server must be confirmed by introspecting the
+# installed vllm-omni (`vllm_omni/model_executor/models/qwen3_tts/*`). If logprobs are NOT
+# exposed here, fall back to Branch B (actor-side teacher-forced codec0 logprobs).
+#
+# ON-POLICY CORRECTNESS: the deploy defaults (top_k=50, repetition_penalty=1.05) make the
+# sampler disagree with the full-softmax logprob (whiplash §9). For GRPO we neutralize them
+# (top_k=-1, repetition_penalty=1.0) so the importance ratio is on-policy.
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0,1,2,3,4,5,6,7"
+    engine_args:
+      model_stage: talker
+      model_arch: Qwen3TTSTalkerForConditionalGeneration   # VALIDATE against installed vllm-omni
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      engine_output_type: codec
+      hf_config_name: talker_config
+
+      tensor_parallel_size: 4
+      distributed_executor_backend: "mp"
+
+      gpu_memory_utilization: 0.35
+      max_num_seqs: 64
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      enable_chunked_prefill: true
+
+      dtype: bfloat16
+      load_format: safetensors
+      trust_remote_code: true
+      enable_prefix_caching: false
+      enforce_eager: true
+
+      enable_sleep_mode: true
+      logprobs_mode: processed_logprobs   # talker codec logprobs for the importance ratio
+      disable_log_stats: true
+
+      # On-policy sampler (neutralize deploy defaults for a correct importance ratio).
+      default_sampling_params:
+        temperature: 1.0
+        top_k: -1
+        top_p: 1.0
+        repetition_penalty: 1.0
+        max_tokens: 2048
+    final_output: false
+
+  - stage_id: 1
+    runtime:
+      devices: "0,1,2,3,4,5,6,7"
+    engine_args:
+      model_stage: code2wav
+      model_arch: Qwen3TTSCode2Wav        # VALIDATE against installed vllm-omni
+      worker_type: code2wav
+      engine_output_type: audio
+      hf_config_name: code2wav_config
+
+      gpu_memory_utilization: 0.25
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+      dtype: bfloat16
+      trust_remote_code: true
+      enable_prefix_caching: false
+      enforce_eager: false
+      disable_log_stats: true
+    final_output: true
+    final_output_type: audio

@@ -1,0 +1,91 @@
+# Qwen3-TTS GRPO — single-node 8×H200 job in the `trainers` namespace.
+#
+# All deps are baked into williammtan/verl-omni-tts; the job clones the code, prepares the
+# dataset from the assistant traces, and runs the recipe. Reward/clone reference and HF caches
+# live on the weka PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: will-tts-grpo
+  namespace: trainers
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: will-tts-grpo
+    spec:
+      restartPolicy: Never
+      priorityClassName: skypilot-high-priority
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H200
+      containers:
+        - name: trainer
+          image: williammtan/verl-omni-tts:v1
+          imagePullPolicy: Always
+          workingDir: /workspace/verl-omni
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ex
+              mkdir -p "${TTS_DIR}"/{hf-cache,modelscope-cache,ckpts,data}
+
+              # --- code checkout (deps are baked) ---
+              test -n "${GITHUB_TOKEN}" || { echo "[error] GITHUB_TOKEN unset"; exit 1; }
+              set +x
+              git config --global credential.helper store
+              printf 'https://x-access-token:%s@github.com\n' "${GITHUB_TOKEN}" > "${HOME}/.git-credentials"
+              chmod 600 "${HOME}/.git-credentials"
+              set -x
+              rm -rf "${CODE_DIR}"
+              git clone --depth 1 --branch "${GIT_REF}" "https://github.com/${GITHUB_REPO}.git" "${CODE_DIR}"
+              git -C "${CODE_DIR}" rev-parse HEAD
+              test -f "${REF_AUDIO}"
+
+              cd "${CODE_DIR}"
+              export PYTHONPATH="${CODE_DIR}:${PYTHONPATH}"   # branch code shadows the baked package
+              # --- dataset: assistant traces -> parquet (cloned from the fixed maeneka voice) ---
+              # Data lives on weka (not committed to git): upload voice_14k_synthetic_04_27_clean.jsonl
+              # to ${DATA_JSONL} once before running (see README / handoff).
+              test -f "${DATA_JSONL}"
+              python examples/qwen3_tts_grpo_trainer/data_process/tts_content_synth.py \
+                --input "${DATA_JSONL}" \
+                --ref_audio "${REF_AUDIO}" \
+                --output_dir "${TTS_DIR}/data"
+
+              # --- train ---
+              bash examples/qwen3_tts_grpo_trainer/run_qwen3_tts_grpo.sh \
+                data.train_files="${TTS_DIR}/data/train.parquet" \
+                data.val_files="${TTS_DIR}/data/test.parquet" \
+                actor_rollout_ref.model.path="${MODEL_ID}" \
+                trainer.default_local_dir="${TTS_DIR}/ckpts" \
+                trainer.total_training_steps="${MAX_STEPS}"
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+            - {name: TTS_DIR, value: "/weka/whiplash-grpo/tts"}
+            - {name: HF_HOME, value: "/weka/whiplash-grpo/tts/hf-cache"}
+            - {name: HUGGINGFACE_HUB_CACHE, value: "/weka/whiplash-grpo/tts/hf-cache"}
+            - {name: MODELSCOPE_CACHE, value: "/weka/whiplash-grpo/tts/modelscope-cache"}
+            - {name: CODE_DIR, value: "/workspace/verl-omni"}
+            - {name: GITHUB_REPO, value: "williammtan/verl-omni"}      # fork holding feat/qwen-tts
+            - {name: GIT_REF, value: "feat/qwen-tts"}
+            - {name: DATA_JSONL, value: "/weka/whiplash-grpo/tts/voice_14k_synthetic_04_27_clean.jsonl"}
+            - {name: MODEL_ID, value: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"}
+            - {name: REF_AUDIO, value: "/weka/whiplash-sft/data/maeneka/ref.wav"}
+            - {name: MAX_STEPS, value: "50"}
+            - {name: GITHUB_TOKEN, valueFrom: {secretKeyRef: {name: will-decagon-github, key: GITHUB_TOKEN}}}
+            - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: will-hf-token, key: HF_TOKEN, optional: true}}}
+            - {name: MLFLOW_TRACKING_URI, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_URI, optional: true}}}
+            - {name: MLFLOW_TRACKING_USERNAME, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_USERNAME, optional: true}}}
+            - {name: MLFLOW_TRACKING_PASSWORD, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_PASSWORD, optional: true}}}
+          resources:
+            requests: {cpu: "32", memory: 600Gi, ephemeral-storage: 50Gi, nvidia.com/gpu: 8}
+            limits: {memory: 1200Gi, ephemeral-storage: 100Gi, nvidia.com/gpu: 8}
+          volumeMounts:
+            - {mountPath: /weka, name: weka}
+            - {mountPath: /dev/shm, name: dshm}
+      volumes:
+        - {name: weka, persistentVolumeClaim: {claimName: weka-data}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 128Gi}}

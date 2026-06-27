@@ -130,3 +130,5 @@ logs
 log
 outputs
 .history
+# Customer-support synthetic transcripts (staged on weka, not committed)
+voice_14k_synthetic_04_27_clean.jsonl
