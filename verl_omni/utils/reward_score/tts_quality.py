@@ -274,6 +274,8 @@ class RewardScorer:
         *,
         whisper_model: str = "large-v3",
         whisper_compute_type: str = "int8",
+        whisper_device: str = "cpu",  # ctranslate2 is a CUDA-12 binary; CPU avoids the cu12/cu13
+                                      # clash with the CUDA-13 vllm/torch stack (whiplash saga).
         spk_model: str = "iic/speech_eres2net_sv_en_voxceleb_16k",
         device: str = "cpu",
         language: str = "en",
@@ -284,6 +286,7 @@ class RewardScorer:
     ):
         self.whisper_model = whisper_model
         self.whisper_compute_type = whisper_compute_type
+        self.whisper_device = whisper_device
         self.spk_model = spk_model
         self.device = device
         self._cuda_index = (
@@ -304,12 +307,15 @@ class RewardScorer:
         if self._asr is None:
             from faster_whisper import WhisperModel
 
-            dev, idx = ("cuda", self._cuda_index) if self.device.startswith("cuda") else (self.device, 0)
-            log.info("loading faster-whisper %r (%s) on %s:%d", self.whisper_model,
-                     self.whisper_compute_type, dev, idx)
-            self._asr = WhisperModel(
-                self.whisper_model, device=dev, device_index=idx, compute_type=self.whisper_compute_type
-            )
+            wd = self.whisper_device
+            if wd.startswith("cuda"):
+                idx = int(wd.split(":", 1)[1]) if ":" in wd else self._cuda_index
+                dev, kw = "cuda", {"device_index": idx}
+            else:
+                dev, kw = "cpu", {}
+            ct = self.whisper_compute_type if dev == "cuda" else "int8"
+            log.info("loading faster-whisper %r (%s) on %s", self.whisper_model, ct, dev)
+            self._asr = WhisperModel(self.whisper_model, device=dev, compute_type=ct, **kw)
         return self._asr
 
     def _spk_embed(self, wav: np.ndarray, sr: int) -> np.ndarray | None:

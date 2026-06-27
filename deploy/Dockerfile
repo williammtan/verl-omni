@@ -7,7 +7,7 @@
 # Build/push (docker login as williammtan):
 #   docker build --platform linux/amd64 -f deploy/Dockerfile -t williammtan/verl-omni-tts:vN .
 #   docker push williammtan/verl-omni-tts:vN   # then bump the tag in deploy/qwen3-tts-grpo-job.yaml
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -25,13 +25,17 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /workspace
-COPY . /workspace/verl-omni
+# Dep-only image: install from PUBLIC upstream verl-omni so no private code is baked. The job
+# clones the private feat/qwen-tts branch at runtime and PYTHONPATH-shadows this install (the
+# new TTS modules live there). Mirrors the whiplash "deps baked, code cloned" pattern.
+ARG VERL_OMNI_REF=main
+RUN git clone --depth 1 --branch "${VERL_OMNI_REF}" https://github.com/verl-project/verl-omni.git /workspace/verl-omni
 
 # Engine stack first (vllm + FA3 kernels), then rollout + train (vllm-omni, verl, verl-omni).
 RUN cd /workspace/verl-omni \
     && uv venv --python 3.12 --seed \
     && . .venv/bin/activate \
-    && uv pip install -e ".[gpu]" --torch-backend=cu128 \
+    && uv pip install -e ".[gpu]" --torch-backend=auto \
     && uv pip install -e ".[vllm-omni,train,dev]" \
     && uv pip install pydub
 
@@ -52,9 +56,9 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
     && python -c "import utmosv2; utmosv2.create_model(pretrained=True, device='cpu'); print('utmosv2 weights OK')"
 
 # Build-time import smoke-check: a broken image fails the build, not a scheduled job.
+# (Only public deps here; the branch's tts_quality module is imported at runtime from the clone.)
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
-    && python -c "import torch, vllm, vllm_omni, verl, verl_omni; \
-from verl_omni.utils.reward_score import tts_quality; \
+    && python -c "import torch, vllm, vllm_omni, verl, verl_omni, faster_whisper, modelscope, utmosv2; \
 print('smoke OK', torch.__version__)"
 
 ENV PATH="/workspace/verl-omni/.venv/bin:${PATH}"
