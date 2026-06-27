@@ -45,4 +45,8 @@ playground
 .huggingface
 **/huggingface
 
+# Large local datasets (staged on weka at runtime, not baked)
+*.jsonl
+*.csv
+
 

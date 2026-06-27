@@ -22,7 +22,7 @@ spec:
         nvidia.com/gpu.product: NVIDIA-H200
       containers:
         - name: trainer
-          image: williammtan/verl-omni-tts:v1
+          image: williammtan/verl-omni-tts:v3
           imagePullPolicy: Always
           workingDir: /workspace/verl-omni
           command: ["/bin/bash", "-lc"]
@@ -68,7 +68,7 @@ spec:
             - {name: HF_HOME, value: "/weka/whiplash-grpo/tts/hf-cache"}
             - {name: HUGGINGFACE_HUB_CACHE, value: "/weka/whiplash-grpo/tts/hf-cache"}
             - {name: MODELSCOPE_CACHE, value: "/weka/whiplash-grpo/tts/modelscope-cache"}
-            - {name: CODE_DIR, value: "/workspace/verl-omni"}
+            - {name: CODE_DIR, value: "/workspace/code"}   # separate from the baked venv at /workspace/verl-omni
             - {name: GITHUB_REPO, value: "williammtan/verl-omni"}      # fork holding feat/qwen-tts
             - {name: GIT_REF, value: "feat/qwen-tts"}
             - {name: DATA_JSONL, value: "/weka/whiplash-grpo/tts/voice_14k_synthetic_04_27_clean.jsonl"}

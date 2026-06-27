@@ -35,7 +35,7 @@ RUN git clone --depth 1 --branch "${VERL_OMNI_REF}" https://github.com/verl-proj
 RUN cd /workspace/verl-omni \
     && uv venv --python 3.12 --seed \
     && . .venv/bin/activate \
-    && uv pip install -e ".[gpu]" --torch-backend=auto \
+    && uv pip install -e ".[gpu]" --torch-backend=cu130 \
     && uv pip install -e ".[vllm-omni,train,dev]" \
     && uv pip install pydub
 
@@ -59,6 +59,7 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
 # (Only public deps here; the branch's tts_quality module is imported at runtime from the clone.)
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
     && python -c "import torch, vllm, vllm_omni, verl, verl_omni, faster_whisper, modelscope, utmosv2; \
+assert torch.version.cuda is not None, 'CPU torch built — need CUDA wheel (set --torch-backend=cuXXX)'; \
 print('smoke OK', torch.__version__)"
 
 ENV PATH="/workspace/verl-omni/.venv/bin:${PATH}"
