@@ -77,9 +77,39 @@ def _register_qwen3_tts_automodel() -> None:
     logger.info("verl_omni.qwen3_tts: registered %s (strip=%s).", model_cls.__name__, _STRIP_MODULES)
 
 
+# Passthrough chat template: Qwen3-TTS-Base is a TTS model with no chat_template, but verl's
+# RLDataset calls tokenizer.apply_chat_template on the prompt. This template just emits each
+# message's content (the line to speak) — so apply_chat_template returns the raw TTS text.
+_TTS_PASSTHROUGH_CHAT_TEMPLATE = (
+    "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+)
+
+
+def patch_hf_tokenizer_for_qwen3_tts() -> None:
+    """Wrap ``verl.utils.tokenizer.hf_tokenizer`` to give chat-template-less tokenizers (Qwen3-TTS)
+    a passthrough template, so verl's dataset tokenization doesn't crash."""
+    try:
+        import verl.utils.tokenizer as _vt
+    except ImportError:
+        return
+
+    _original_hf_tokenizer = _vt.hf_tokenizer
+
+    def _patched_hf_tokenizer(name_or_path, **kwargs):
+        tok = _original_hf_tokenizer(name_or_path, **kwargs)
+        if tok is not None and not getattr(tok, "chat_template", None):
+            tok.chat_template = _TTS_PASSTHROUGH_CHAT_TEMPLATE
+            logger.info("verl_omni.qwen3_tts: installed passthrough chat_template on %s.",
+                        type(tok).__name__)
+        return tok
+
+    _vt.hf_tokenizer = _patched_hf_tokenizer
+
+
 def apply_qwen3_tts_patches() -> None:
     """Apply all Qwen3-TTS patches (idempotent)."""
     _register_qwen3_tts_automodel()
+    patch_hf_tokenizer_for_qwen3_tts()
 
 
 # Apply on import so this module works as a verl ``external_lib`` target.
