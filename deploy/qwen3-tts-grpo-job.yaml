@@ -22,7 +22,7 @@ spec:
         nvidia.com/gpu.product: NVIDIA-H200
       containers:
         - name: trainer
-          image: williammtan/verl-omni-tts:v3
+          image: williammtan/verl-omni-tts:v4
           imagePullPolicy: Always
           workingDir: /workspace/verl-omni
           command: ["/bin/bash", "-lc"]

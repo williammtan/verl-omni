@@ -49,7 +49,9 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
         librosa \
         soundfile \
         "git+https://github.com/sarulab-speech/UTMOSv2.git" \
-    && uv pip install "pyarrow<21"  # verl/datasets need pyarrow.PyExtensionType (removed in 21); keep numpy 2.x for vllm
+    && uv pip install "pyarrow<21" "datasets>=2.16,<4"  # reward backends drag datasets down to 1.1.1
+       # (no built-in parquet builder -> tries to fetch parquet.py from GitHub); pyarrow<21 keeps
+       # PyExtensionType; numpy stays 2.x for vllm.
 
 # Pre-fetch UTMOSv2 weights at build time (exercise the real path, not a best-effort echo).
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
@@ -58,9 +60,10 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
 # Build-time import smoke-check: a broken image fails the build, not a scheduled job.
 # (Only public deps here; the branch's tts_quality module is imported at runtime from the clone.)
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
-    && python -c "import torch, vllm, vllm_omni, verl, verl_omni, faster_whisper, modelscope, utmosv2; \
+    && python -c "import torch, vllm, vllm_omni, verl, verl_omni, faster_whisper, modelscope, utmosv2, datasets; \
 assert torch.version.cuda is not None, 'CPU torch built — need CUDA wheel (set --torch-backend=cuXXX)'; \
-print('smoke OK', torch.__version__)"
+assert int(datasets.__version__.split('.')[0]) >= 2, f'datasets too old: {datasets.__version__}'; \
+print('smoke OK', torch.__version__, 'datasets', datasets.__version__)"
 
 ENV PATH="/workspace/verl-omni/.venv/bin:${PATH}"
 WORKDIR /workspace/verl-omni
