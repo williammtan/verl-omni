@@ -24,7 +24,8 @@ data:
   train_batch_size: 32        # prompts per step (global); each gets rollout.n samples
   max_prompt_length: 512      # CX-rep lines are short (p95 ~327 chars)
   max_response_length: 2048   # codec tokens (~Base max_new_tokens); 12Hz → ~170s ceiling
-  filter_overlong_prompts: true
+  filter_overlong_prompts: false  # CX lines are short; the filter's per-sample try/except hides
+                                   # real errors ("skipping...") — keep it off for this recipe
   truncation: left
 
 actor_rollout_ref:
