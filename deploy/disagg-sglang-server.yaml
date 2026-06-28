@@ -1,0 +1,69 @@
+# Disaggregated GRPO rollout server: patched sglang-omni serving Qwen3-TTS-12Hz-1.7B with the
+# return_codes token-export. The trainer (deploy/grpo-job-disagg.yaml) hits this Service via
+# --sglang-url. 1 replica (1 H200) — the validated 1-trainer:1-sglang unit, which serves a single
+# rank's ~32 concurrent rollouts/step comfortably. Model downloads to the weka HF cache.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: will-grpo-sglang
+  namespace: trainers
+  labels: {app: will-grpo-sglang}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: will-grpo-sglang}
+  template:
+    metadata:
+      labels: {app: will-grpo-sglang}
+    spec:
+      priorityClassName: skypilot-high-priority
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H200
+      containers:
+        - name: sglang
+          image: williammtan/sglang-omni-grpo:v1
+          imagePullPolicy: Always
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: "/weka/whiplash-grpo/hf-cache"
+            - name: HUGGINGFACE_HUB_CACHE
+              value: "/weka/whiplash-grpo/hf-cache"
+            - name: MODEL_ID
+              value: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ex
+              mkdir -p "${HF_HOME}"
+              # --model-path auto-builds the Qwen3-TTS pipeline (preprocessing -> tts_engine -> vocoder).
+              exec sgl-omni serve --model-path "${MODEL_ID}" --host 0.0.0.0 --port 8000
+          ports:
+            - {containerPort: 8000, name: http}
+          readinessProbe:
+            httpGet: {path: /v1/models, port: 8000}
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 40   # allow ~10min for first-run model download + server warmup
+          resources:
+            requests: {cpu: "8", memory: 120Gi, nvidia.com/gpu: 1, ephemeral-storage: 20Gi}
+            limits: {nvidia.com/gpu: 1, memory: 240Gi}
+          volumeMounts:
+            - {name: weka, mountPath: /weka}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - name: weka
+          persistentVolumeClaim: {claimName: weka-data}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 64Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: will-grpo-sglang
+  namespace: trainers
+spec:
+  selector: {app: will-grpo-sglang}
+  ports:
+    - {port: 8000, targetPort: 8000, name: http}

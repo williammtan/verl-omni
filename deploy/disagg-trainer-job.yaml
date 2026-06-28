@@ -1,0 +1,108 @@
+# Disaggregated GRPO trainer (qwen-tts, transformers 4.57.3 baked image) — talks to the sglang-omni
+# rollout server (disagg-sglang.yaml) via --sglang-url, on the assistant-traces data.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: will-tts-grpo-disagg
+  namespace: trainers
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: {labels: {app: will-tts-grpo-disagg}}
+    spec:
+      restartPolicy: Never
+      priorityClassName: skypilot-high-priority
+      nodeSelector: {nvidia.com/gpu.product: NVIDIA-H200}
+      containers:
+        - name: grpo
+          image: williammtan/whiplash-grpo:v3
+          imagePullPolicy: Always
+          workingDir: /root
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+            - {name: GRPO_DIR, value: "/weka/whiplash-grpo"}
+            - {name: HF_HOME, value: "/weka/whiplash-grpo/hf-cache"}
+            - {name: HUGGINGFACE_HUB_CACHE, value: "/weka/whiplash-grpo/hf-cache"}
+            - {name: MODELSCOPE_CACHE, value: "/weka/whiplash-grpo/modelscope-cache"}
+            - {name: CODE_DIR, value: "/workspace/whiplash"}
+            - {name: GITHUB_REPO, value: "Osmosis-AI/whiplash"}
+            - {name: GIT_REF, value: "grpo-ablations"}
+            - {name: GITHUB_TOKEN, valueFrom: {secretKeyRef: {name: will-decagon-github, key: GITHUB_TOKEN}}}
+            - {name: MODEL_ID, value: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"}
+            - {name: REF_AUDIO, value: "/weka/whiplash-sft/data/maeneka/ref.wav"}
+            - {name: DATA_JSONL, value: "/weka/whiplash-grpo/tts/voice_14k_synthetic_04_27_clean.jsonl"}
+            - {name: PROMPTS_JSONL, value: "/weka/whiplash-grpo/tts/assistant_prompts.jsonl"}
+            - {name: MAX_STEPS, value: "50"}
+            - {name: MLFLOW_TRACKING_URI, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_URI, optional: true}}}
+            - {name: MLFLOW_TRACKING_USERNAME, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_USERNAME, optional: true}}}
+            - {name: MLFLOW_TRACKING_PASSWORD, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_PASSWORD, optional: true}}}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ex
+              mkdir -p "${GRPO_DIR}"/{hf-cache,modelscope-cache,ckpts} "$(dirname "${CODE_DIR}")"
+              test -n "${GITHUB_TOKEN}" || { echo "[error] GITHUB_TOKEN unset"; exit 1; }
+              set +x
+              git config --global credential.helper store
+              printf 'https://x-access-token:%s@github.com\n' "${GITHUB_TOKEN}" > "${HOME}/.git-credentials"
+              chmod 600 "${HOME}/.git-credentials"
+              set -x
+              rm -rf "${CODE_DIR}"
+              git clone --depth 1 --branch "${GIT_REF}" "https://github.com/${GITHUB_REPO}.git" "${CODE_DIR}"
+              test -f "${REF_AUDIO}"; test -f "${DATA_JSONL}"
+              cd "${CODE_DIR}"
+
+              # Build whiplash prompts.jsonl from ALL assistant message contents (dedup).
+              python - <<'PY'
+              import json, os
+              src=os.environ["DATA_JSONL"]; out=os.environ["PROMPTS_JSONL"]; seen=set(); n=0
+              with open(src) as f, open(out,"w") as w:
+                  for line in f:
+                      line=line.strip()
+                      if not line: continue
+                      conv=json.loads(line); cid=conv.get("conversation_id","conv"); k=0
+                      for m in conv.get("messages",[]):
+                          if m.get("role")!="assistant": continue
+                          t=(m.get("content") or "").strip()
+                          if len(t)<8 or t in seen: continue
+                          seen.add(t)
+                          w.write(json.dumps({"id":f"{cid}#{k}","text":t})+"\n"); k+=1; n+=1
+              print(f"[prompts] wrote {n} assistant lines -> {out}", flush=True)
+              PY
+
+              ML_FLAG="--mlflow"; [ -z "${MLFLOW_TRACKING_URI}" ] && ML_FLAG="--no-mlflow"
+
+              # Wait for the sglang rollout Service to be Ready.
+              python - <<'PY'
+              import sys, time, urllib.request
+              url="http://will-grpo-sglang:8000/v1/models"
+              for i in range(180):
+                  try: urllib.request.urlopen(url, timeout=5); print(f"[wait] sglang ready after {i*10}s", flush=True); sys.exit(0)
+                  except Exception as e:
+                      if i%6==0: print(f"[wait] sglang not ready ({e})", flush=True)
+                      time.sleep(10)
+              sys.exit("[wait] sglang never became ready")
+              PY
+
+              python -m whiplash.run grpo \
+                  --prompts "${PROMPTS_JSONL}" \
+                  --ref-audio "${REF_AUDIO}" \
+                  --model-id "${MODEL_ID}" \
+                  --config conf/grpo/synth.yaml \
+                  --out "${GRPO_DIR}/ckpts" \
+                  --sglang-url "http://will-grpo-sglang:8000" \
+                  --nproc 1 \
+                  --max-steps "${MAX_STEPS}" \
+                  --mlflow-run-name will-tts-grpo-disagg \
+                  ${ML_FLAG}
+          resources:
+            requests: {cpu: "32", memory: 600Gi, nvidia.com/gpu: 1, ephemeral-storage: 20Gi}
+            limits: {nvidia.com/gpu: 1, memory: 1200Gi, ephemeral-storage: 50Gi}
+          volumeMounts:
+            - {name: weka, mountPath: /weka}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: weka, persistentVolumeClaim: {claimName: weka-data}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 128Gi}}
