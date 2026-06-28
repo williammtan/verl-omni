@@ -34,7 +34,7 @@ spec:
             - {name: REF_AUDIO, value: "/weka/whiplash-sft/data/maeneka/ref.wav"}
             - {name: DATA_JSONL, value: "/weka/whiplash-grpo/tts/voice_14k_synthetic_04_27_clean.jsonl"}
             - {name: PROMPTS_JSONL, value: "/weka/whiplash-grpo/tts/assistant_prompts.jsonl"}
-            - {name: MAX_STEPS, value: "50"}
+            - {name: MAX_STEPS, value: "3224"}   # full pass: ceil(25790 prompts / 8 per step)
             - {name: MLFLOW_TRACKING_URI, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_URI, optional: true}}}
             - {name: MLFLOW_TRACKING_USERNAME, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_USERNAME, optional: true}}}
             - {name: MLFLOW_TRACKING_PASSWORD, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_PASSWORD, optional: true}}}
@@ -53,6 +53,9 @@ spec:
               git clone --depth 1 --branch "${GIT_REF}" "https://github.com/${GITHUB_REPO}.git" "${CODE_DIR}"
               test -f "${REF_AUDIO}"; test -f "${DATA_JSONL}"
               cd "${CODE_DIR}"
+              # 64 rollouts/step: prompts_per_step 4->8 (x g=8). (config-only knob; no CLI flag.)
+              sed -i 's/^prompts_per_step:.*/prompts_per_step: 8/' conf/grpo/synth.yaml
+              grep -E '^prompts_per_step:|^g:' conf/grpo/synth.yaml
               # modelscope's ERes2Net speaker pipeline needs addict + datasets (+ small deps),
               # missing in the image — without them the SIM reward silently degrades to 0.
               pip install -q addict datasets simplejson sortedcontainers || true
