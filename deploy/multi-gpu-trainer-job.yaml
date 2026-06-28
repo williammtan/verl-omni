@@ -1,0 +1,97 @@
+# Multi-GPU (8xH200) in-process DDP GRPO for Qwen3-TTS — whiplash's validated 8-GPU path.
+# Each rank loads policy + frozen ref on its own GPU, generates via qwen-tts, scores, and runs the
+# codec_0 logprob forward through GRPOPolicy (accelerate all-reduce armed). No sglang/vllm.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: will-tts-grpo-multi
+  namespace: trainers
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: {labels: {app: will-tts-grpo-multi}}
+    spec:
+      restartPolicy: Never
+      priorityClassName: skypilot-high-priority
+      nodeSelector: {nvidia.com/gpu.product: NVIDIA-H200}
+      containers:
+        - name: grpo
+          image: williammtan/whiplash-grpo:v3
+          imagePullPolicy: Always
+          workingDir: /root
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+            - {name: NCCL_IB_DISABLE, value: "1"}
+            - {name: GRPO_DIR, value: "/weka/whiplash-grpo"}
+            - {name: HF_HOME, value: "/weka/whiplash-grpo/hf-cache"}
+            - {name: HUGGINGFACE_HUB_CACHE, value: "/weka/whiplash-grpo/hf-cache"}
+            - {name: MODELSCOPE_CACHE, value: "/weka/whiplash-grpo/modelscope-cache"}
+            - {name: CODE_DIR, value: "/workspace/whiplash"}
+            - {name: GITHUB_REPO, value: "Osmosis-AI/whiplash"}
+            - {name: GIT_REF, value: "grpo-ablations"}
+            - {name: GITHUB_TOKEN, valueFrom: {secretKeyRef: {name: will-decagon-github, key: GITHUB_TOKEN}}}
+            - {name: MODEL_ID, value: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"}
+            - {name: REF_AUDIO, value: "/weka/whiplash-sft/data/maeneka/ref.wav"}
+            - {name: DATA_JSONL, value: "/weka/whiplash-grpo/tts/voice_14k_synthetic_04_27_clean.jsonl"}
+            - {name: PROMPTS_JSONL, value: "/weka/whiplash-grpo/tts/assistant_prompts.jsonl"}
+            - {name: NPROC, value: "8"}
+            - {name: MAX_STEPS, value: "3224"}   # ~1 full pass: 25790 prompts / (8 prompts/step)
+            - {name: MLFLOW_TRACKING_URI, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_URI, optional: true}}}
+            - {name: MLFLOW_TRACKING_USERNAME, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_USERNAME, optional: true}}}
+            - {name: MLFLOW_TRACKING_PASSWORD, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_PASSWORD, optional: true}}}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ex
+              mkdir -p "${GRPO_DIR}"/{hf-cache,modelscope-cache,ckpts} "$(dirname "${CODE_DIR}")"
+              set +x
+              git config --global credential.helper store
+              printf 'https://x-access-token:%s@github.com\n' "${GITHUB_TOKEN}" > "${HOME}/.git-credentials"
+              chmod 600 "${HOME}/.git-credentials"; set -x
+              rm -rf "${CODE_DIR}"
+              git clone --depth 1 --branch "${GIT_REF}" "https://github.com/${GITHUB_REPO}.git" "${CODE_DIR}"
+              test -f "${REF_AUDIO}"; test -f "${DATA_JSONL}"
+              cd "${CODE_DIR}"
+              # 64 global rollouts/step = prompts_per_step(1 per rank) x nproc(8) x g(8).
+              sed -i 's/^prompts_per_step:.*/prompts_per_step: 1/' conf/grpo/synth.yaml
+              grep -E '^prompts_per_step:|^g:' conf/grpo/synth.yaml
+              pip install -q addict datasets simplejson sortedcontainers || true
+              # Build prompts.jsonl from ALL assistant lines (dedup) if not present.
+              python - <<'PY'
+              import json, os
+              src=os.environ["DATA_JSONL"]; out=os.environ["PROMPTS_JSONL"]; seen=set(); n=0
+              with open(src) as f, open(out,"w") as w:
+                  for line in f:
+                      line=line.strip()
+                      if not line: continue
+                      conv=json.loads(line); cid=conv.get("conversation_id","conv"); k=0
+                      for m in conv.get("messages",[]):
+                          if m.get("role")!="assistant": continue
+                          t=(m.get("content") or "").strip()
+                          if len(t)<8 or t in seen: continue
+                          seen.add(t); w.write(json.dumps({"id":f"{cid}#{k}","text":t})+"\n"); k+=1; n+=1
+              print(f"[prompts] wrote {n} assistant lines", flush=True)
+              PY
+              ML_FLAG="--mlflow"; [ -z "${MLFLOW_TRACKING_URI}" ] && ML_FLAG="--no-mlflow"
+              # In-process engine (no --sglang-url) -> accelerate launch --num_processes=NPROC --multi_gpu.
+              python -m whiplash.run grpo \
+                  --prompts "${PROMPTS_JSONL}" \
+                  --ref-audio "${REF_AUDIO}" \
+                  --model-id "${MODEL_ID}" \
+                  --config conf/grpo/synth.yaml \
+                  --out "${GRPO_DIR}/ckpts" \
+                  --nproc "${NPROC}" \
+                  --max-steps "${MAX_STEPS}" \
+                  --mlflow-run-name will-tts-grpo-multi8 \
+                  ${ML_FLAG}
+          resources:
+            requests: {cpu: "64", memory: 1000Gi, nvidia.com/gpu: 8, ephemeral-storage: 30Gi}
+            limits: {nvidia.com/gpu: 8, memory: 1600Gi, ephemeral-storage: 80Gi}
+          volumeMounts:
+            - {name: weka, mountPath: /weka}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: weka, persistentVolumeClaim: {claimName: weka-data}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 200Gi}}
