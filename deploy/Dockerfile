@@ -52,14 +52,9 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
     && uv pip install "pyarrow<21" "datasets>=2.16,<4"  # reward backends drag datasets down to 1.1.1
        # (no built-in parquet builder -> tries to fetch parquet.py from GitHub); pyarrow<21 keeps
        # PyExtensionType; numpy stays 2.x for vllm.
-
-# Trainable Qwen3-TTS talker actor: qwen-tts ships the transformers-based Qwen3TTSModel (the vllm-omni
-# talker is inference-only). It needs transformers 4.57.x — which the GSPO recipe proves vLLM-Omni 0.22
-# tolerates (the .[train] install pulls 5.x; pin back to 4.57.6). qwen-tts last after, to keep its pin.
-RUN cd /workspace/verl-omni && . .venv/bin/activate \
-    && uv pip install "qwen-tts==0.1.1" "huggingface_hub==0.36.2"
-    # qwen-tts pins transformers==4.57.3 (downgrades the .[train] 5.x); hf_hub 0.36.2 is the
-    # whiplash-validated match (a newer hf_hub's strict-dataclass rejects transformers 4.57.3).
+# NOTE: qwen-tts (the trainable actor) is intentionally NOT installed here — it requires
+# transformers 4.57.x / huggingface_hub<1.0, which is incompatible with vLLM-Omni's hub>=1.0. The
+# two run in SEPARATE images (disaggregated): this image = vLLM-Omni rollout; trainer = qwen-tts.
 
 # Pre-fetch UTMOSv2 weights at build time (exercise the real path, not a best-effort echo).
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
@@ -68,11 +63,10 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
 # Build-time import smoke-check: a broken image fails the build, not a scheduled job.
 # (Only public deps here; the branch's tts_quality module is imported at runtime from the clone.)
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
-    && python -c "import torch, vllm, vllm_omni, verl, verl_omni, faster_whisper, modelscope, utmosv2, datasets, transformers, qwen_tts; \
+    && python -c "import torch, vllm, vllm_omni, verl, verl_omni, faster_whisper, modelscope, utmosv2, datasets; \
 assert torch.version.cuda is not None, 'CPU torch built — need CUDA wheel (set --torch-backend=cuXXX)'; \
 assert int(datasets.__version__.split('.')[0]) >= 2, f'datasets too old: {datasets.__version__}'; \
-assert transformers.__version__.startswith('4.57'), f'transformers must be 4.57.x: {transformers.__version__}'; \
-print('smoke OK', torch.__version__, 'tf', transformers.__version__, 'datasets', datasets.__version__)"
+print('smoke OK', torch.__version__, 'datasets', datasets.__version__)"
 
 ENV PATH="/workspace/verl-omni/.venv/bin:${PATH}"
 WORKDIR /workspace/verl-omni
