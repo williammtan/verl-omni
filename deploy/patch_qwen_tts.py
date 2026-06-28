@@ -36,10 +36,11 @@ def patch_rope(s):
         "    return inv_freq, 1.0\n"
     )
     if "_qtts_default_rope_init" not in s:
-        # insert helper after the first import of ROPE_INIT_FUNCTIONS
-        m = re.search(r"^from transformers\.modeling_rope_utils import .*ROPE_INIT_FUNCTIONS.*$", s, re.M)
-        if m:
-            s = s[:m.end()] + "\n" + helper + s[m.end():]
+        # insert helper at top level, right before the rotary class def (always safe).
+        anchor = "class Qwen3TTSTalkerRotaryEmbedding"
+        i = s.find(anchor)
+        if i != -1:
+            s = s[:i] + helper + "\n\n" + s[i:]
         else:
             s = helper + s
     s = s.replace(
