@@ -57,7 +57,9 @@ RUN cd /workspace/verl-omni && . .venv/bin/activate \
 # talker is inference-only). It needs transformers 4.57.x — which the GSPO recipe proves vLLM-Omni 0.22
 # tolerates (the .[train] install pulls 5.x; pin back to 4.57.6). qwen-tts last after, to keep its pin.
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
-    && uv pip install "qwen-tts==0.1.1"   # pins transformers==4.57.3 (downgrades the .[train] 5.x)
+    && uv pip install "qwen-tts==0.1.1" "huggingface_hub==0.36.2"
+    # qwen-tts pins transformers==4.57.3 (downgrades the .[train] 5.x); hf_hub 0.36.2 is the
+    # whiplash-validated match (a newer hf_hub's strict-dataclass rejects transformers 4.57.3).
 
 # Pre-fetch UTMOSv2 weights at build time (exercise the real path, not a best-effort echo).
 RUN cd /workspace/verl-omni && . .venv/bin/activate \
