@@ -53,9 +53,9 @@ spec:
               git clone --depth 1 --branch "${GIT_REF}" "https://github.com/${GITHUB_REPO}.git" "${CODE_DIR}"
               test -f "${REF_AUDIO}"; test -f "${DATA_JSONL}"
               cd "${CODE_DIR}"
-              # modelscope's ERes2Net speaker pipeline needs `addict` (missing in the image) —
-              # without it the SIM reward silently degrades to 0. Install at runtime.
-              pip install -q addict || true
+              # modelscope's ERes2Net speaker pipeline needs addict + datasets (+ small deps),
+              # missing in the image — without them the SIM reward silently degrades to 0.
+              pip install -q addict datasets simplejson sortedcontainers || true
 
               # Build whiplash prompts.jsonl from ALL assistant message contents (dedup).
               python - <<'PY'
