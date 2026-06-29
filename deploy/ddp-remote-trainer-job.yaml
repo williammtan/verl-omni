@@ -38,7 +38,8 @@ spec:
             - {name: SGLANG_URL, value: "http://will-grpo-sglang:8000"}
             - {name: REWARD_URL, value: "http://will-tts-reward:8100"}   # offloaded reward
             - {name: NPROC, value: "2"}
-            - {name: PROMPTS_PER_STEP, value: "4"}   # global rollouts = PROMPTS_PER_STEP * NPROC * g(8)
+            - {name: SGLANG_SYNC_EVERY, value: "4"}
+            - {name: PROMPTS_PER_STEP, value: "8"}   # global rollouts = PROMPTS_PER_STEP * NPROC * g(8)
             - {name: MAX_STEPS, value: "3224"}
             - {name: VERL_OMNI_REF, value: "feat/qwen-tts"}   # for the remote-reward patcher
             - {name: MLFLOW_TRACKING_URI, valueFrom: {secretKeyRef: {name: will-decagon-mlflow, key: MLFLOW_TRACKING_URI, optional: true}}}

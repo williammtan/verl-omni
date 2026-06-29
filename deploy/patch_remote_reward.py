@@ -59,6 +59,14 @@ new = ("    import os as _os\n"
 assert old in s, "scorer construction line not found — whiplash layout changed"
 s = s.replace(old, new)
 
+# Make sglang weight-sync frequency env-driven (default 1). Syncing every step copies the model +
+# speech-tokenizer snapshot to disk for sglang to reload — a big fixed per-step cost. SGLANG_SYNC_EVERY=4
+# amortizes it 4x (mildly off-policy, tolerated by the KL+clip; verl-omni-style bounded staleness).
+s = s.replace(
+    'p.add_argument("--sglang-sync-every", type=int, default=1,',
+    'p.add_argument("--sglang-sync-every", type=int, default=int(__import__("os").environ.get("SGLANG_SYNC_EVERY", "1")),',
+)
+
 if s != orig:
     F.write_text(s)
     print("patched grpo_trainer.py (remote reward)")
