@@ -1,0 +1,65 @@
+# HTTP TTS reward server (verl-omni-style scorer) — offloads reward scoring off the trainer GPU.
+# Uses the whiplash image (CUDA 12: faster-whisper on GPU works) + verl-omni's tts_reward_server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: will-tts-reward
+  namespace: trainers
+  labels: {app: will-tts-reward}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: will-tts-reward}}
+  template:
+    metadata: {labels: {app: will-tts-reward}}
+    spec:
+      priorityClassName: skypilot-high-priority
+      nodeSelector: {nvidia.com/gpu.product: NVIDIA-H200}
+      containers:
+        - name: reward
+          image: williammtan/whiplash-grpo:v3
+          imagePullPolicy: Always
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: HF_HOME, value: "/weka/whiplash-grpo/hf-cache"}
+            - {name: HUGGINGFACE_HUB_CACHE, value: "/weka/whiplash-grpo/hf-cache"}
+            - {name: MODELSCOPE_CACHE, value: "/weka/whiplash-grpo/modelscope-cache"}
+            - {name: REWARD_DEVICE, value: "cuda:0"}
+            - {name: WHISPER_DEVICE, value: "cuda:0"}   # CUDA-12 image: whisper on GPU
+            - {name: PORT, value: "8100"}
+            - {name: GITHUB_TOKEN, valueFrom: {secretKeyRef: {name: will-decagon-github, key: GITHUB_TOKEN}}}
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ex
+              set +x
+              git config --global credential.helper store
+              printf 'https://x-access-token:%s@github.com\n' "${GITHUB_TOKEN}" > "${HOME}/.git-credentials"
+              chmod 600 "${HOME}/.git-credentials"; set -x
+              rm -rf /workspace/code
+              git clone --depth 1 --branch feat/qwen-tts https://github.com/williammtan/verl-omni.git /workspace/code
+              pip install -q fastapi uvicorn requests addict datasets simplejson sortedcontainers || true
+              cd /workspace/code
+              export PYTHONPATH=/workspace/code
+              python /workspace/code/verl_omni/utils/reward_score/tts_reward_server.py
+          ports: [{containerPort: 8100, name: http}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8100}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60
+          resources:
+            requests: {cpu: "16", memory: 200Gi, nvidia.com/gpu: 1, ephemeral-storage: 20Gi}
+            limits: {nvidia.com/gpu: 1, memory: 360Gi}
+          volumeMounts:
+            - {name: weka, mountPath: /weka}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: weka, persistentVolumeClaim: {claimName: weka-data}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 32Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: will-tts-reward, namespace: trainers}
+spec:
+  selector: {app: will-tts-reward}
+  ports: [{port: 8100, targetPort: 8100, name: http}]
