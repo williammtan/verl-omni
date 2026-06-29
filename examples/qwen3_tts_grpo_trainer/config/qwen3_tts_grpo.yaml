@@ -93,7 +93,12 @@ actor_rollout_ref:
         min_num_params: 100000000
 
 algorithm:
-  adv_estimator: grpo           # per-group z-score of the fused TTS reward
+  # GLM-TTS hierarchical normalization: per-dim z-score within the group → weighted
+  # fuse → batch whiten. Decouples the 4 TTS reward dims so the noisiest one (or the
+  # -10 synth-fail outlier) can't dominate the single fused z-score (the old `grpo` path).
+  adv_estimator: gdpo
+  gdpo_reward_keys: [rw_text, rw_sim, rw_mos, rw_stab]   # per-sample keys from TTSRewardManager
+  gdpo_reward_weights: [1.0, 1.0, 1.0, 1.0]              # applied AFTER per-dim z-score
   use_kl_in_reward: false
 
 reward:

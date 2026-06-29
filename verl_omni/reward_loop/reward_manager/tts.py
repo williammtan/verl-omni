@@ -28,7 +28,7 @@ import torch
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 
-from verl_omni.utils.reward_score.tts_quality import RewardConfig, RewardScorer, fused_reward
+from verl_omni.utils.reward_score.tts_quality import RewardConfig, RewardScorer, fused_reward, raw_rewards
 
 
 def _load_ref_wav(path):
@@ -103,15 +103,28 @@ class TTSRewardManager(RewardManagerBase):
 
         def _score():
             if wav is None or wav.size == 0:
-                return {"score": -10.0, "synth_ok": 0.0}  # hard synth failure
+                # Hard synth failure: worst-case per-dim rewards (sign-correct for GDPO).
+                # Key set MUST match the success branch — the reward loop reads keys from
+                # sample 0 only and hard-indexes every sample, so a ragged dict drops
+                # dimensions or KeyErrors (reward_loop.py:371-374).
+                return {
+                    "score": -10.0,
+                    "rw_text": -1.0, "rw_sim": 0.0, "rw_mos": 1.0,
+                    "rw_stab": -float(self.reward_cfg.p_fail),
+                    "cer": -1.0, "sim": -1.0, "mos": -1.0,
+                    "synth_ok": 0.0, "truncated": 0.0, "repeated": 0.0,
+                }
             if ref_audio not in self._ref_cache:
                 self._ref_cache[ref_audio] = _load_ref_wav(ref_audio)
             res = self.scorer.score(
                 wav, sr, id=str(uid), text=text, ref_audio_wav=self._ref_cache[ref_audio], group_key=str(uid)
             )
             score = fused_reward(res, self.reward_cfg)
+            raw = raw_rewards(res, self.reward_cfg)  # per-dim rewards for GDPO (higher = better)
             return {
                 "score": float(score),
+                "rw_text": float(raw["text"]), "rw_sim": float(raw["sim"]),
+                "rw_mos": float(raw["mos"]), "rw_stab": float(raw.get("stab", 0.0)),
                 "cer": res.cer if res.cer is not None else -1.0,
                 "sim": res.spk_similarity if res.spk_similarity is not None else -1.0,
                 "mos": res.utmos if res.utmos is not None else -1.0,
