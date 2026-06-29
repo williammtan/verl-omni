@@ -53,6 +53,9 @@ spec:
               git clone --depth 1 --branch "${GIT_REF}" "https://github.com/${GITHUB_REPO}.git" "${CODE_DIR}"
               test -f "${REF_AUDIO}"; test -f "${DATA_JSONL}"
               cd "${CODE_DIR}"
+              # Resilience: retry transient sglang errors so a 500/restart does not kill the run.
+              git clone --depth 1 --branch feat/qwen-tts https://github.com/williammtan/verl-omni.git /workspace/code 2>/dev/null || true
+              python /workspace/code/deploy/patch_sglang_retry.py "${CODE_DIR}/whiplash"
               # 64 global rollouts/step = prompts_per_step(4 per rank) x nproc(2) x g(8).  DDP data-parallel.
               sed -i 's/^prompts_per_step:.*/prompts_per_step: 4/' conf/grpo/synth.yaml
               grep -E '^prompts_per_step:|^g:' conf/grpo/synth.yaml
