@@ -54,7 +54,7 @@ spec:
               test -f "${REF_AUDIO}"; test -f "${DATA_JSONL}"
               cd "${CODE_DIR}"
               # 64 global rollouts/step = prompts_per_step(4 per rank) x nproc(2) x g(8).  DDP data-parallel.
-              sed -i 's/^prompts_per_step:.*/prompts_per_step: 4/' conf/grpo/synth.yaml
+              sed -i 's/^prompts_per_step:.*/prompts_per_step: 8/' conf/grpo/synth.yaml
               grep -E '^prompts_per_step:|^g:' conf/grpo/synth.yaml
               # modelscope's ERes2Net speaker pipeline needs addict + datasets (+ small deps),
               # missing in the image — without them the SIM reward silently degrades to 0.
@@ -99,13 +99,13 @@ spec:
                   --config conf/grpo/synth.yaml \
                   --out "${GRPO_DIR}/ckpts" \
                   --sglang-url "http://will-grpo-sglang:8000" \
-                  --nproc 2 \
+                  --nproc 1 \
                   --max-steps "${MAX_STEPS}" \
                   --mlflow-run-name will-tts-grpo-disagg \
                   ${ML_FLAG}
           resources:
-            requests: {cpu: "32", memory: 600Gi, nvidia.com/gpu: 2, ephemeral-storage: 20Gi}
-            limits: {nvidia.com/gpu: 2, memory: 1200Gi, ephemeral-storage: 50Gi}
+            requests: {cpu: "32", memory: 600Gi, nvidia.com/gpu: 1, ephemeral-storage: 20Gi}
+            limits: {nvidia.com/gpu: 1, memory: 1200Gi, ephemeral-storage: 50Gi}
           volumeMounts:
             - {name: weka, mountPath: /weka}
             - {name: dshm, mountPath: /dev/shm}
