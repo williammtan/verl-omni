@@ -399,6 +399,16 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 raise RuntimeError("AR mode expects request_output with token IDs, but got None.")
 
             extra_fields = {"global_steps": self.global_steps}
+            # Surface the talker's full (T,16) sampled codes for the native Qwen3-TTS actor's
+            # teacher-forced codec-0 logprob (consumed by the qwen3_tts MM patch). No vLLM-Omni
+            # edit: the codes ride the cumulative AR multimodal_output. No-op for non-TTS AR.
+            try:
+                mm = final_res.multimodal_output
+                audio_codes = mm.get("codes", {}).get("audio") if mm is not None else None
+                if audio_codes is not None:
+                    extra_fields["tts_audio_codes"] = audio_codes
+            except Exception:  # noqa: BLE001 — never let code-surfacing break a rollout
+                pass
             token_ids = req_output.outputs[0].token_ids
             log_probs = None
             if params.logprobs is not None:
