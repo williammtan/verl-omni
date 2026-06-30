@@ -88,7 +88,21 @@ class TTSRewardManager(RewardManagerBase):
             w_stab=float(rc.get("w_stab", 1.0)) if isinstance(rc, dict) else 1.0,
         )
         device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-        self.scorer = RewardScorer(device=device)
+        # Whisper ASR (intelligibility/CER reward) defaults to CPU faster-whisper (the ctranslate2
+        # cu12-vs-cu13 punt). Opt into GPU ASR via env: VERL_TTS_WHISPER_DEVICE=cuda runs whisper on
+        # the reward worker's GPU using the torch-native transformers backend (distil-whisper by
+        # default) -- much faster and far lighter on host RAM than CPU large-v3.
+        whisper_kw: dict = {}
+        _wd = os.environ.get("VERL_TTS_WHISPER_DEVICE")
+        if _wd:
+            whisper_kw["whisper_device"] = device if _wd == "cuda" else _wd
+            whisper_kw["whisper_model"] = os.environ.get(
+                "VERL_TTS_WHISPER_MODEL", "distil-whisper/distil-large-v3"
+            )
+            _wb = os.environ.get("VERL_TTS_WHISPER_BACKEND")
+            if _wb:
+                whisper_kw["whisper_backend"] = _wb
+        self.scorer = RewardScorer(device=device, **whisper_kw)
         self._ref_cache: dict = {}
         # Reward-side code2wav: when the rollout surfaces codec tokens but no waveform
         # (single-stage talker), decode (T,16) codes -> 24kHz wav here and score that.

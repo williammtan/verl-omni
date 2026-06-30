@@ -40,6 +40,15 @@ import re
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch.nn as _nn
+
+# Pristine nn.Module hooks captured at import time -- BEFORE a later reward-side code2wav load
+# (Qwen3TTSTokenizer device_map=...) can leak accelerate.init_empty_weights, which patches
+# register_parameter to meta-init and makes any subsequent from_pretrained land on the meta device
+# (so .to(cuda) then raises "Cannot copy out of meta tensor"). _asr_model restores these before the
+# GPU-whisper load so it materializes real weights. tts_quality is imported at reward-worker startup,
+# before any model loads, so these are guaranteed pristine here.
+_PRISTINE_NN_HOOKS = (_nn.Module.register_parameter, _nn.Module.register_buffer)
 
 log = logging.getLogger("verl_omni.tts_quality")
 
@@ -276,6 +285,7 @@ class RewardScorer:
         whisper_compute_type: str = "int8",
         whisper_device: str = "cpu",  # ctranslate2 is a CUDA-12 binary; CPU avoids the cu12/cu13
                                       # clash with the CUDA-13 vllm/torch stack (whiplash saga).
+        whisper_backend: str | None = None,  # None -> auto: "transformers" on cuda, "faster" on cpu
         spk_model: str = "iic/speech_eres2net_sv_en_voxceleb_16k",
         device: str = "cpu",
         language: str = "en",
@@ -287,6 +297,7 @@ class RewardScorer:
         self.whisper_model = whisper_model
         self.whisper_compute_type = whisper_compute_type
         self.whisper_device = whisper_device
+        self.whisper_backend = whisper_backend
         self.spk_model = spk_model
         self.device = device
         self._cuda_index = (
@@ -301,21 +312,69 @@ class RewardScorer:
         self._spk = None
         self._utmos = None
         self._utmos_failed = False  # once create_model fails, give up (never retry → no loop)
+        import threading
+
+        self._asr_lock = threading.Lock()
+        # Eager-load the GPU whisper model at construction (single-threaded, before any concurrent
+        # reward-side model loads start) to avoid a register_parameter meta-init race: the reward
+        # scores many clips concurrently, so N concurrent lazy first-loads would race with a
+        # concurrent accelerate device_map load (code2wav/spk/utmos) that transiently patches
+        # nn.Module.register_parameter to meta-init -> "Cannot copy out of meta tensor". CPU
+        # faster-whisper stays lazy (ctranslate2, no nn.Module, no race).
+        if self.whisper_backend == "transformers" or self.whisper_device.startswith("cuda"):
+            try:
+                self._asr_model()
+            except Exception as e:  # noqa: BLE001
+                log.warning("eager whisper warmup failed (%s) — will load lazily", e)
 
     # --- lazy backends ---------------------------------------------------------------
     def _asr_model(self):
-        if self._asr is None:
-            from faster_whisper import WhisperModel
-
+        # Returns (backend, model). Two backends:
+        #   "faster"       -- faster-whisper/ctranslate2 (CPU; cu12 binary clashes with the cu13 stack)
+        #   "transformers" -- torch-native whisper (GPU; cu13-native, used for cuda + distil-whisper)
+        # GPU defaults to the transformers backend so we avoid the ctranslate2 cu12/cu13 wall entirely.
+        if self._asr is not None:
+            return self._asr
+        with self._asr_lock:                      # load exactly once per worker (see __init__ note)
+            if self._asr is not None:
+                return self._asr
             wd = self.whisper_device
-            if wd.startswith("cuda"):
-                idx = int(wd.split(":", 1)[1]) if ":" in wd else self._cuda_index
-                dev, kw = "cuda", {"device_index": idx}
+            use_cuda = wd.startswith("cuda")
+            backend = self.whisper_backend or ("transformers" if use_cuda else "faster")
+            if backend == "transformers":
+                import torch
+                import torch.nn as nn
+                from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+                idx = int(wd.split(":", 1)[1]) if (use_cuda and ":" in wd) else self._cuda_index
+                dev = f"cuda:{idx}" if use_cuda else "cpu"
+                dtype = torch.float16 if use_cuda else torch.float32
+                log.info("loading transformers-whisper %r on %s", self.whisper_model, dev)
+                # Belt-and-suspenders for the register_parameter meta-init race (eager warmup in
+                # __init__ is the primary guard): restore the pristine nn.Module hooks captured at
+                # import so from_pretrained materializes real weights instead of meta.
+                nn.Module.register_parameter, nn.Module.register_buffer = _PRISTINE_NN_HOOKS
+                model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                    self.whisper_model, dtype=dtype, low_cpu_mem_usage=False,
+                ).to(dev).eval()
+                proc = AutoProcessor.from_pretrained(self.whisper_model)
+                pipe = pipeline(
+                    "automatic-speech-recognition", model=model,
+                    tokenizer=proc.tokenizer, feature_extractor=proc.feature_extractor,
+                    torch_dtype=dtype, device=dev, chunk_length_s=30,
+                )
+                self._asr = ("transformers", pipe)
             else:
-                dev, kw = "cpu", {}
-            ct = self.whisper_compute_type if dev == "cuda" else "int8"
-            log.info("loading faster-whisper %r (%s) on %s", self.whisper_model, ct, dev)
-            self._asr = WhisperModel(self.whisper_model, device=dev, compute_type=ct, **kw)
+                from faster_whisper import WhisperModel
+
+                if use_cuda:
+                    idx = int(wd.split(":", 1)[1]) if ":" in wd else self._cuda_index
+                    dev, kw = "cuda", {"device_index": idx}
+                else:
+                    dev, kw = "cpu", {}
+                ct = self.whisper_compute_type if dev == "cuda" else "int8"
+                log.info("loading faster-whisper %r (%s) on %s", self.whisper_model, ct, dev)
+                self._asr = ("faster", WhisperModel(self.whisper_model, device=dev, compute_type=ct, **kw))
         return self._asr
 
     def _spk_embed(self, wav: np.ndarray, sr: int) -> np.ndarray | None:
@@ -354,9 +413,24 @@ class RewardScorer:
 
     # --- scoring ---------------------------------------------------------------------
     def transcribe(self, wav: np.ndarray, sr: int) -> str:
-        seg_iter, _ = self._asr_model().transcribe(
-            _resample(wav, sr, 16000), language=self.language, beam_size=1,
-            condition_on_previous_text=False,
+        backend, model = self._asr_model()
+        audio = np.asarray(_resample(wav, sr, 16000), dtype=np.float32)
+        if backend == "transformers":
+            import torch
+
+            # The reward worker's torch default device can be 'meta' (leaked from prior model
+            # loads); the HF pipeline's dataloader calls .item() which dies on a meta default.
+            # Pin it to cpu for the inference call, then restore.
+            _prev_dev = torch.get_default_device()
+            torch.set_default_device("cpu")
+            try:
+                # distil-whisper/distil-large-v3 is English-only -> no language kwarg (errors on one)
+                out = model({"array": audio, "sampling_rate": 16000})
+            finally:
+                torch.set_default_device(_prev_dev)
+            return (out.get("text") or "").strip()
+        seg_iter, _ = model.transcribe(
+            audio, language=self.language, beam_size=1, condition_on_previous_text=False,
         )
         return " ".join(s.text.strip() for s in seg_iter).strip()
 
