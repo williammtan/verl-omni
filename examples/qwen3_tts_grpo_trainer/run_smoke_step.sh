@@ -10,13 +10,9 @@ export VERL_TTS_MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base   # reward-side code2wa
 export NCCL_IB_DISABLE=1
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export HYDRA_FULL_ERROR=1
-export VERL_TTS_DEBUG=1         # print talker-batch id ranges vs vocab sizes in tts_actor_logits
-export VERL_TTS_DUMP=1          # dump first rollout samples (token_ids/codes/logprobs/text) for diagnostics
-export VERL_TTS_PROBDUMP=1      # dump sample-0 per-token actor-vs-rollout logprobs (on-policy diagnostic)
-export VERL_TTS_DUMP_DIR=/weka/whiplash-grpo/tts/dump
 python deploy/patch_vllm_omni_ar_rescue.py || exit 22  # single-stage talker AR decode rescue
 python deploy/patch_verl_unpad_fallback.py || exit 23   # verl unpad->transformers fallback (no flash-attn)
-python deploy/patch_verl_probdump.py || exit 24         # sample-0 per-token actor-vs-rollout logprob dump
+python deploy/patch_verl_ref_offload.py || exit 25      # ref policy via verl manual offload (KL/ref)
 python -c "import verl_omni.models.transformers.qwen3_tts as q; print('patch module loaded')" || exit 21
 TRAIN_FILE=/weka/whiplash-grpo/tts/verl_smoke/train.parquet \
 VAL_FILE=/weka/whiplash-grpo/tts/verl_smoke/test.parquet \
@@ -28,7 +24,7 @@ bash examples/qwen3_tts_grpo_trainer/run_qwen3_tts_grpo.sh \
   actor_rollout_ref.actor.fsdp_config.param_offload=false \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
   actor_rollout_ref.ref.fsdp_config.param_offload=false \
-  actor_rollout_ref.actor.use_kl_loss=false \
+  actor_rollout_ref.actor.use_kl_loss=true \
   data.train_batch_size=8 \
   actor_rollout_ref.actor.ppo_mini_batch_size=8 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

@@ -312,7 +312,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             self._tts_spk_xvector = xvec
         tok = self.model_config.tokenizer
         text = tok.decode(prompt_ids, skip_special_tokens=True).strip()
-        self._tts_last_text = text  # for the VERL_TTS_DUMP diagnostic (actor-vs-rollout per-token)
         additional_information = {
             "task_type": ["Base"],
             "text": [text],
@@ -468,9 +467,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 except Exception:  # noqa: BLE001
                     pass
         self._tts_accumulated_codes = acc_codes
-        if for_tts and os.environ.get("VERL_TTS_DEBUG"):
-            print(f"[tts-dbg run] accumulated_codes_shape="
-                  f"{tuple(acc_codes.shape) if acc_codes is not None else None}", flush=True)
         return final_res
 
     def _process_output(self, final_res, params, sampling_params: dict[str, Any]):
@@ -494,52 +490,45 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             # No vLLM-Omni edit. No-op for non-TTS AR.
             audio_codes = getattr(self, "_tts_accumulated_codes", None)
             if audio_codes is not None:
-                # Align codes col-0 to token_ids by the best leading offset. The accumulated stream begins
-                # with ~placeholder zero frames PLUS one codec_bos transition frame, so the codec-0 (col 0)
-                # leads token_ids by `placeholder+1`. Matching is robust to that off-by-one — verified
-                # codes[k+1,0]==token_ids[k] at 100% across samples; without it every sub-codebook the actor
-                # teacher-forces is shifted one frame, which dominates the rollout↔actor logprob gap.
+                # Align the accumulated (T,16) codes to token_ids so codes[k,0] == token_ids[k]. The stream
+                # is [placeholder/codec_bos frames whose col-0 == 0] + [real decode frames whose col-0 ==
+                # token_ids, in order]. Find where the real run starts with a SHORT probe and take L frames.
+                #
+                # A short probe is load-bearing: the old code probed `min(L,128)` and required `o+probe <=
+                # len(stream)`, which forces the offset <= len(stream)-L and so EXCLUDES the true start
+                # whenever the stream is one frame short of L (the common case — the codec_eos frame is not
+                # emitted). The codes then stay shifted one frame (codes[k+1,0]==token_ids[k], a leading zero
+                # placeholder), scrambling every sub-codebook the actor teacher-forces — the WHOLE rollout↔
+                # actor on-policy gap (faithful replay: pearson 0.16 shifted vs 0.999 aligned, mean|Δlogp|
+                # 7.6 vs 0.014). Placeholder frames are zero, so token_ids[:probe] (real codes) matches only
+                # at the real start; take the first exact-prefix offset.
                 L = len(token_ids)
-                tid_t = torch.as_tensor(list(token_ids))
-                base = audio_codes.shape[0] - L
-                probe = min(L, 128)
-                best_o, best_m = max(0, base), -1.0
-                for o in range(max(0, base - 2), base + 3):
-                    if probe > 0 and o + probe <= audio_codes.shape[0]:
-                        m = (audio_codes[o : o + probe, 0] == tid_t[:probe]).float().mean().item()
-                        if m > best_m:
-                            best_m, best_o = m, o
-                audio_codes = audio_codes[best_o : best_o + L]  # may be L-1 near the tail; actor uses min()
+                tid_t = torch.as_tensor(list(token_ids), dtype=audio_codes.dtype)
+                A = audio_codes.shape[0]
+                probe = min(L, 16)
+                best_o, best_m = max(0, A - L), -1.0
+                for o in range(0, max(1, A - probe + 1)):
+                    m = (audio_codes[o : o + probe, 0] == tid_t[:probe]).float().mean().item()
+                    if m > best_m:
+                        best_m, best_o = m, o
+                        if best_m >= 0.999:
+                            break  # exact prefix match: the real decode run starts here
+                audio_codes = audio_codes[best_o : best_o + L]
+                if audio_codes.shape[0] < L:
+                    # Stream short at the tail: pad so the codes count stays == L (response length), keeping
+                    # the actor's response_start (= L_i - response_len) aligned. The padded frame's
+                    # sub-codebooks are never used as context for an in-response token; set col-0 to the
+                    # matching token_ids for consistency.
+                    pad_n = L - audio_codes.shape[0]
+                    pad = audio_codes.new_zeros((pad_n, audio_codes.shape[1]))
+                    pad[:, 0] = tid_t[L - pad_n : L]
+                    audio_codes = torch.cat([audio_codes, pad], dim=0)
                 extra_fields["tts_audio_codes"] = audio_codes
-            if os.environ.get("VERL_TTS_DEBUG"):
-                sh = tuple(audio_codes.shape) if hasattr(audio_codes, "shape") else None
-                print(f"[tts-dbg proc] token_ids_len={len(token_ids)} codes_shape_after_strip={sh}", flush=True)
             log_probs = None
             if params.logprobs is not None:
                 log_probs = [
                     logprobs[token_ids[i]].logprob for i, logprobs in enumerate(req_output.outputs[0].logprobs)
                 ]
-
-            if os.environ.get("VERL_TTS_DUMP"):  # capture a few rollout samples for offline diagnostics
-                try:
-                    n = getattr(self, "_tts_dump_n", 0)
-                    if n < 4:
-                        d = os.environ.get("VERL_TTS_DUMP_DIR", "/weka/whiplash-grpo/tts/dump")
-                        os.makedirs(d, exist_ok=True)
-                        torch.save(
-                            {
-                                "token_ids": torch.as_tensor(list(token_ids), dtype=torch.long),
-                                "codes": audio_codes,  # (T,16) after prefix strip
-                                "log_probs": (torch.as_tensor(log_probs) if log_probs is not None else None),
-                                "text": getattr(self, "_tts_last_text", None),
-                                "finish_reason": req_output.outputs[0].finish_reason,
-                            },
-                            os.path.join(d, f"sample_{n}.pt"),
-                        )
-                        self._tts_dump_n = n + 1
-                        print(f"[tts-dump] wrote sample_{n}.pt token_ids_len={len(token_ids)}", flush=True)
-                except Exception as e:  # noqa: BLE001
-                    print(f"[tts-dump] failed: {e!r}", flush=True)
 
             finish_reason = req_output.outputs[0].finish_reason
             stop_reason = self._map_stop_reason(finish_reason)

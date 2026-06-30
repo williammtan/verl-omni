@@ -45,7 +45,6 @@ total ``t = max(tl + cl) + 8``:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
@@ -199,14 +198,6 @@ def assemble_talker_embeddings(talker, batch: TalkerBatch, speaker_emb: torch.Te
     / ``.code_predictor.get_input_embeddings()``).
     """
     ids = batch.input_ids
-    if os.environ.get("VERL_TTS_DEBUG"):
-        sub0 = talker.code_predictor.get_input_embeddings()[0]
-        print(
-            f"[tts-dev] text_emb={talker.model.text_embedding.weight.device} "
-            f"codec_emb={talker.model.codec_embedding.weight.device} "
-            f"sub0={sub0.weight.device} ids={ids.device} spk={speaker_emb.device}",
-            flush=True,
-        )
     # vLLM-Omni generation runs every text-side embedding (incl. the tts_pad at the speaker slot)
     # through talker.text_projection — a learned ResizeMLP, NOT identity (prompt_embeds_builder.py:
     # 1280, 1236). whiplash's codec0_logprobs skips it (it never compares rollout-vs-actor, using
@@ -279,21 +270,6 @@ def tts_actor_logits(
     tokens = TalkerTokens.from_config(model.config)
     sub_vocab = int(talker.code_predictor.get_input_embeddings()[0].num_embeddings)
 
-    if os.environ.get("VERL_TTS_DEBUG"):
-        te_v = int(talker.model.text_embedding.num_embeddings)
-        ce_v = int(talker.model.codec_embedding.num_embeddings)
-        for i in range(b):
-            rl, tl, li = int(response_len[i]), int(text_len[i]), int(real_len[i])
-            ac, ti = audio_codes_list[i], text_ids_list[i]
-            print(
-                f"[tts-dbg] i={i} L={li} resp_len={rl} text_len={tl} rs={li - rl} "
-                f"codec0[min={int(ac[:, 0].min())},max={int(ac[:, 0].max())}] "
-                f"sub[min={int(ac[:, 1:].min())},max={int(ac[:, 1:].max())}] "
-                f"text[min={int(ti.min())},max={int(ti.max())}]",
-                flush=True,
-            )
-        print(f"[tts-dbg] vocab text_emb={te_v} codec_emb={ce_v} sub_emb={sub_vocab}", flush=True)
-
     batch = build_talker_batch(text_ids_list, audio_codes_list, tokens, device=device, sub_codebook_vocab=sub_vocab)
     whip_logits = codec0_logits(talker, batch, speaker_emb)
     vocab = whip_logits.shape[-1]
@@ -301,17 +277,6 @@ def tts_actor_logits(
     # slicing the response, so out_logits must be wide enough for the text-prompt labels too (they
     # are discarded downstream). Widen to cover max(codec vocab, any input id).
     out_vocab = max(vocab, int(input_ids.max().item()) + 1)
-    if os.environ.get("VERL_TTS_DEBUG"):
-        for i in range(b):
-            rl, li = int(response_len[i]), int(real_len[i])
-            rs = li - rl
-            resp = input_ids[i, rs : rs + rl]
-            print(
-                f"[tts-dbg fwd] i={i} codec_head_vocab={vocab} "
-                f"verl_resp_codec0[min={int(resp.min())},max={int(resp.max())}] "
-                f"mm_codec0[max={int(audio_codes_list[i][:, 0].max())}] rs={rs} rl={rl}",
-                flush=True,
-            )
     return realign_to_verl(whip_logits, batch, response_starts, (b, t_out, out_vocab))
 
 
