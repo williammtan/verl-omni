@@ -165,8 +165,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         os.environ["MASTER_PORT"] = str(diffusion_master_port)
         logger.info("Using MASTER_PORT=%s for vLLM-Omni workers", os.environ["MASTER_PORT"])
 
-        engine_args["diffusion_attention_backend"] = self.config.rollout_attn_backend
-        logger.info("Setting diffusion_attention_backend=%s from rollout config", self.config.rollout_attn_backend)
+        # rollout_attn_backend is a diffusion-recipe rollout field; the AR/TTS RolloutConfig does not
+        # carry it, so only forward it when present (else AsyncOmni uses its own default).
+        _attn_backend = getattr(self.config, "rollout_attn_backend", None)
+        if _attn_backend is not None:
+            engine_args["diffusion_attention_backend"] = _attn_backend
+            logger.info("Setting diffusion_attention_backend=%s from rollout config", _attn_backend)
 
         engine_client = AsyncOmni(**engine_args)
         app = build_app(args)
@@ -288,6 +292,50 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # Mode-specific pipeline steps
     # -----------------------------------------------------------------------
 
+    def _tts_voice_clone_request(self, prompt_ids: list[int]):
+        """Build the Qwen3-TTS talker's voice-clone request (Base task + fixed precomputed x-vector),
+        so the talker conditions generation on the spoken text + clone voice. Gated on
+        ``VERL_TTS_SPK_EMBED``; returns ``(None, prompt_ids)`` for non-TTS AR rollouts.
+
+        Returns ``(additional_information, placeholder_prompt_ids)``. The talker overwrites all prompt
+        embeddings, so the placeholder's *values* are ignored — only its length matters; we size it to
+        the talker's prompt length (8-slot control prefix + the assistant-wrapped text)."""
+        path = os.environ.get("VERL_TTS_SPK_EMBED")
+        if not path:
+            return None, prompt_ids
+        xvec = getattr(self, "_tts_spk_xvector", None)
+        if xvec is None:
+            import json
+
+            with open(path) as f:
+                xvec = json.load(f)  # list[float], speaker-encoder dim (1024)
+            self._tts_spk_xvector = xvec
+        tok = self.model_config.tokenizer
+        text = tok.decode(prompt_ids, skip_special_tokens=True).strip()
+        self._tts_last_text = text  # for the VERL_TTS_DUMP diagnostic (actor-vs-rollout per-token)
+        additional_information = {
+            "task_type": ["Base"],
+            "text": [text],
+            "language": ["Auto"],
+            "x_vector_only_mode": [True],
+            # Non-streaming: lay the FULL text into the prefill (one set of positions before the
+            # codec span), the layout the native actor reconstructs in build_talker_batch. The Base
+            # default is streaming (text fed one-token-per-decode-step, summed onto codec frames),
+            # whose generation log-probs can't be on-policy with the actor's full-context recompute
+            # (prompt_embeds_builder.py:921-932,1277-1297). A bool here overrides the task_type default.
+            "non_streaming_mode": [True],
+            "voice_clone_prompt": [{"ref_spk_embedding": xvec}],
+        }
+        # Placeholder length MUST equal the talker's real non-streaming prompt length, else the talker
+        # wedges tts_pad rows between codec_bos and decode-frame-0 (qwen3_tts_talker.py:702-706), shifting
+        # every codec frame's RoPE vs the actor's reconstruction. For Base + x_vector_only + non_streaming
+        # the estimator gives exactly `assistant_len + 2` (prompt_embeds_builder.py:1500-1590), where
+        # assistant_len tokenizes build_assistant_text(text) with DEFAULT add_special_tokens.
+        wrapped = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        assistant_len = len(tok(wrapped)["input_ids"])
+        placeholder = [0] * (assistant_len + 2)
+        return additional_information, placeholder
+
     def _preprocess_input(
         self,
         prompt_ids: list[int],
@@ -330,11 +378,24 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             else:
                 sampling_params["logprobs"] = None
             sampling_params.setdefault("repetition_penalty", getattr(self.config, "repetition_penalty", 1.0))
+            if os.environ.get("VERL_TTS_SPK_EMBED"):
+                # TTS talker: stop at codec_eos so the rollout terminates at the real utterance. The
+                # model emits codec_eos (talker_config.codec_eos_token_id == 2150 for this ckpt; its own
+                # stop logic is `first_codebook == codec_eos_token_id`, modeling_qwen3_tts.py:2284) ~100-120
+                # frames in, then generates garbage to max_tokens (2048 ≈ 170s). Making it a vLLM stop token
+                # yields short, meaningful responses (clean reward audio + no garbage tail in the policy update).
+                eos_id = int(os.environ.get("VERL_TTS_CODEC_EOS", "2150"))
+                se = list(sampling_params.get("stop_token_ids") or [])
+                if eos_id not in se:
+                    sampling_params["stop_token_ids"] = se + [eos_id]
             params = SamplingParams(max_tokens=max_tokens, **sampling_params)
 
-            prompt = {"prompt_token_ids": prompt_ids}
+            tts_ai, ar_prompt_ids = self._tts_voice_clone_request(prompt_ids)
+            prompt = {"prompt_token_ids": ar_prompt_ids}
             if multi_modal_data:
                 prompt["multi_modal_data"] = multi_modal_data
+            if tts_ai is not None:
+                prompt["additional_information"] = tts_ai
             return prompt, params
 
         # diffusion
@@ -384,8 +445,32 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 sampling_params_list=params,
             )
         final_res: Optional[OmniRequestOutput] = None
+        # The talker streams its (T,16) codes one frame per decode step; the engine keeps only the
+        # last yielded output, so accumulate the per-step deltas here to recover the full sequence
+        # (the native actor teacher-forces them). Only for the TTS rollout (VERL_TTS_SPK_EMBED set).
+        acc_codes = None
+        for_tts = bool(os.environ.get("VERL_TTS_SPK_EMBED"))
         async for output in generator:
             final_res = output
+            if for_tts:
+                try:
+                    _mm = output.multimodal_output
+                    _a = _mm.get("codes", {}).get("audio") if _mm is not None else None
+                    if _a is not None:
+                        _a = torch.as_tensor(_a)
+                        if _a.ndim == 2 and _a.shape[0] > 0:
+                            if acc_codes is None:
+                                acc_codes = _a
+                            elif _a.shape[0] > acc_codes.shape[0]:
+                                acc_codes = _a  # cumulative snapshot: keep the largest
+                            else:
+                                acc_codes = torch.cat([acc_codes, _a], dim=0)  # per-step delta: concat
+                except Exception:  # noqa: BLE001
+                    pass
+        self._tts_accumulated_codes = acc_codes
+        if for_tts and os.environ.get("VERL_TTS_DEBUG"):
+            print(f"[tts-dbg run] accumulated_codes_shape="
+                  f"{tuple(acc_codes.shape) if acc_codes is not None else None}", flush=True)
         return final_res
 
     def _process_output(self, final_res, params, sampling_params: dict[str, Any]):
@@ -399,22 +484,62 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 raise RuntimeError("AR mode expects request_output with token IDs, but got None.")
 
             extra_fields = {"global_steps": self.global_steps}
-            # Surface the talker's full (T,16) sampled codes for the native Qwen3-TTS actor's
-            # teacher-forced codec-0 logprob (consumed by the qwen3_tts MM patch). No vLLM-Omni
-            # edit: the codes ride the cumulative AR multimodal_output. No-op for non-TTS AR.
-            try:
-                mm = final_res.multimodal_output
-                audio_codes = mm.get("codes", {}).get("audio") if mm is not None else None
-                if audio_codes is not None:
-                    extra_fields["tts_audio_codes"] = audio_codes
-            except Exception:  # noqa: BLE001 — never let code-surfacing break a rollout
-                pass
             token_ids = req_output.outputs[0].token_ids
+            # Surface the talker's full (T,16) sampled codes for the native Qwen3-TTS actor's
+            # teacher-forced codec-0 logprob (consumed by the qwen3_tts MM patch). The accumulated
+            # stream begins with `offset` zero PREFILL-PLACEHOLDER frames (the talker writes a zero
+            # codes block sized to the prompt placeholder before the first decode step); the real
+            # per-step frames are the SUFFIX. Strip the prefix so codes[:,0] == token_ids and the
+            # actor teacher-forces the matching codec-0 + sub-codebooks (qwen3_tts_talker.py:713-718).
+            # No vLLM-Omni edit. No-op for non-TTS AR.
+            audio_codes = getattr(self, "_tts_accumulated_codes", None)
+            if audio_codes is not None:
+                # Align codes col-0 to token_ids by the best leading offset. The accumulated stream begins
+                # with ~placeholder zero frames PLUS one codec_bos transition frame, so the codec-0 (col 0)
+                # leads token_ids by `placeholder+1`. Matching is robust to that off-by-one — verified
+                # codes[k+1,0]==token_ids[k] at 100% across samples; without it every sub-codebook the actor
+                # teacher-forces is shifted one frame, which dominates the rollout↔actor logprob gap.
+                L = len(token_ids)
+                tid_t = torch.as_tensor(list(token_ids))
+                base = audio_codes.shape[0] - L
+                probe = min(L, 128)
+                best_o, best_m = max(0, base), -1.0
+                for o in range(max(0, base - 2), base + 3):
+                    if probe > 0 and o + probe <= audio_codes.shape[0]:
+                        m = (audio_codes[o : o + probe, 0] == tid_t[:probe]).float().mean().item()
+                        if m > best_m:
+                            best_m, best_o = m, o
+                audio_codes = audio_codes[best_o : best_o + L]  # may be L-1 near the tail; actor uses min()
+                extra_fields["tts_audio_codes"] = audio_codes
+            if os.environ.get("VERL_TTS_DEBUG"):
+                sh = tuple(audio_codes.shape) if hasattr(audio_codes, "shape") else None
+                print(f"[tts-dbg proc] token_ids_len={len(token_ids)} codes_shape_after_strip={sh}", flush=True)
             log_probs = None
             if params.logprobs is not None:
                 log_probs = [
                     logprobs[token_ids[i]].logprob for i, logprobs in enumerate(req_output.outputs[0].logprobs)
                 ]
+
+            if os.environ.get("VERL_TTS_DUMP"):  # capture a few rollout samples for offline diagnostics
+                try:
+                    n = getattr(self, "_tts_dump_n", 0)
+                    if n < 4:
+                        d = os.environ.get("VERL_TTS_DUMP_DIR", "/weka/whiplash-grpo/tts/dump")
+                        os.makedirs(d, exist_ok=True)
+                        torch.save(
+                            {
+                                "token_ids": torch.as_tensor(list(token_ids), dtype=torch.long),
+                                "codes": audio_codes,  # (T,16) after prefix strip
+                                "log_probs": (torch.as_tensor(log_probs) if log_probs is not None else None),
+                                "text": getattr(self, "_tts_last_text", None),
+                                "finish_reason": req_output.outputs[0].finish_reason,
+                            },
+                            os.path.join(d, f"sample_{n}.pt"),
+                        )
+                        self._tts_dump_n = n + 1
+                        print(f"[tts-dump] wrote sample_{n}.pt token_ids_len={len(token_ids)}", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[tts-dump] failed: {e!r}", flush=True)
 
             finish_reason = req_output.outputs[0].finish_reason
             stop_reason = self._map_stop_reason(finish_reason)

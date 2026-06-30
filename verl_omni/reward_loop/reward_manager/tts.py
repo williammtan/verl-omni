@@ -23,10 +23,14 @@ One ``RewardScorer`` (lazy, in-process metric models) is held per manager and pi
 Mirrors the structure of :class:`VisualRewardManager`.
 """
 
+import os
+import threading
+
 import numpy as np
 import torch
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
+from verl.experimental.reward_loop.reward_manager.registry import register
 
 from verl_omni.utils.reward_score.tts_quality import RewardConfig, RewardScorer, fused_reward, raw_rewards
 
@@ -70,6 +74,7 @@ def _extract_audio(data_item):
     return audio, sr
 
 
+@register("TTSRewardManager")
 class TTSRewardManager(RewardManagerBase):
     """Scores decoded Qwen3-TTS rollouts on the multi-metric TTS reward."""
 
@@ -85,11 +90,82 @@ class TTSRewardManager(RewardManagerBase):
         device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
         self.scorer = RewardScorer(device=device)
         self._ref_cache: dict = {}
+        # Reward-side code2wav: when the rollout surfaces codec tokens but no waveform
+        # (single-stage talker), decode (T,16) codes -> 24kHz wav here and score that.
+        # Lazy-loads only the qwen-tts speech_tokenizer (the small conv vocoder, not the
+        # 1.7B talker), pinned to the reward GPU. Path source: VERL_TTS_MODEL_PATH env,
+        # else the actor model path, else the public Base checkpoint.
+        self._device = device
+        self._decoder = None
+        self._decoder_lock = threading.Lock()
+        self._codebook_max = 2047
+        mp = os.environ.get("VERL_TTS_MODEL_PATH")
+        if not mp:
+            try:
+                mp = config.actor_rollout_ref.model.path
+            except Exception:
+                mp = None
+        self._model_path = mp or "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
     @classmethod
     def assemble_rm_scores(cls, data: DataProto, scores: list[float]) -> torch.Tensor:
         """Per-sample audio rewards: ``rm_scores`` has shape ``(batch_size, 1)``."""
         return torch.tensor(scores, dtype=torch.float32).unsqueeze(-1)
+
+    def _get_decoder(self):
+        """Lazy-load the qwen-tts speech_tokenizer (code2wav vocoder) on the reward GPU.
+
+        Resolves the ``speech_tokenizer/`` subfolder the way ``Qwen3TTSModel`` does
+        (``cached_file`` -> ``dirname``), so an HF repo id or a local checkpoint dir both
+        work. Guarded by a lock — reward samples score in concurrent executor threads.
+        """
+        if self._decoder is not None:
+            return self._decoder
+        with self._decoder_lock:
+            if self._decoder is None:
+                from qwen_tts import Qwen3TTSTokenizer
+                from transformers.utils import cached_file
+
+                cfg = cached_file(self._model_path, "speech_tokenizer/config.json")
+                st_dir = os.path.dirname(cfg)
+                dec = Qwen3TTSTokenizer.from_pretrained(st_dir, device_map=self._device, dtype=torch.bfloat16)
+                try:
+                    self._codebook_max = int(dec.model.config.decoder_config.codebook_size) - 1
+                except Exception:
+                    pass
+                self._decoder = dec
+        return self._decoder
+
+    def _decode_codes(self, data_item):
+        """Decode surfaced rollout codec tokens ``(T,16)`` -> ``(wav float32, sr)``.
+
+        Returns ``(None, None)`` when no codes are present so the caller falls through to
+        the synth-fail sentinel. Clamps to ``[0, codebook_size)`` (the tokenizer only
+        clamps the lower bound; an out-of-range index device-asserts).
+        """
+        # The rollout's extra_fields (incl. tts_audio_codes) are packed by verl's agent loop
+        # into non_tensor_batch["tool_extra_fields"] as one object-array dict (agent_loop.py:976;
+        # same path visual.py:52 reads). After data[0] it's the dict itself.
+        tef = data_item.non_tensor_batch.get("tool_extra_fields")
+        if isinstance(tef, np.ndarray) and tef.dtype == object:  # defensive: unwrap if not yet indexed
+            tef = tef.item() if tef.ndim == 0 else (tef[0] if len(tef) else None)
+        codes = tef.get("tts_audio_codes") if isinstance(tef, dict) else None
+        if codes is None:
+            return None, None
+        codes = torch.as_tensor(codes, dtype=torch.long)
+        if codes.ndim != 2 or codes.shape[-1] != 16:
+            return None, None
+        # Trim post-eos garbage: the talker emits codec_eos (2150) ~100-120 frames in; with rollout
+        # eos-stop the codes are already short, but trim defensively so we never decode the ~170s tail.
+        eos = (codes[:, 0] == 2150).nonzero().flatten()
+        if len(eos):
+            codes = codes[: int(eos[0])]
+        if codes.shape[0] == 0:
+            return None, None
+        dec = self._get_decoder()
+        codes = codes.clamp_(0, self._codebook_max)
+        wavs, sr = dec.decode([{"audio_codes": codes}])
+        return np.asarray(wavs[0], dtype=np.float32).reshape(-1), int(sr)
 
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
@@ -102,7 +178,10 @@ class TTSRewardManager(RewardManagerBase):
         wav, sr = _extract_audio(data_item)
 
         def _score():
-            if wav is None or wav.size == 0:
+            w, s = wav, sr
+            if w is None:
+                w, s = self._decode_codes(data_item)  # decode codes->wav in the executor thread
+            if w is None or w.size == 0:
                 # Hard synth failure: worst-case per-dim rewards (sign-correct for GDPO).
                 # Key set MUST match the success branch — the reward loop reads keys from
                 # sample 0 only and hard-indexes every sample, so a ragged dict drops
@@ -117,7 +196,7 @@ class TTSRewardManager(RewardManagerBase):
             if ref_audio not in self._ref_cache:
                 self._ref_cache[ref_audio] = _load_ref_wav(ref_audio)
             res = self.scorer.score(
-                wav, sr, id=str(uid), text=text, ref_audio_wav=self._ref_cache[ref_audio], group_key=str(uid)
+                w, s, id=str(uid), text=text, ref_audio_wav=self._ref_cache[ref_audio], group_key=str(uid)
             )
             score = fused_reward(res, self.reward_cfg)
             raw = raw_rewards(res, self.reward_cfg)  # per-dim rewards for GDPO (higher = better)

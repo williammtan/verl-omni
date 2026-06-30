@@ -50,34 +50,28 @@ _TRAINABLE_PREFIXES = ("talker.model.", "talker.codec_head.")
 # Speaker embedding cache — one fixed clone voice for the whole run (see recipe README), so the
 # ref mel + speaker_encoder forward is computed once and reused.
 # --------------------------------------------------------------------------------------------
-def _load_ref_mel(ref_audio_path: str) -> torch.Tensor:
-    """Mel for the speaker_encoder, matching whiplash TTSDataset._extract_mels (24 kHz / n_fft 1024
-    / 128 mels / hop 256 / win 1024 / fmin 0 / fmax 12000)."""
-    import librosa
-    import numpy as np
-    from qwen_tts.utils.mel import mel_spectrogram  # qwen-tts ships the same mel as whiplash
+def load_speaker_xvector(path: str | None = None) -> torch.Tensor:
+    """Load the precomputed fixed-clone x-vector (1024-dim ECAPA, the model's
+    ``extract_speaker_embedding``) from ``VERL_TTS_SPK_EMBED`` (a JSON float list). The SAME vector
+    feeds the rollout (``voice_clone_prompt.ref_spk_embedding``) and the actor (speaker @ pos6), so
+    generation and the teacher-forced recompute condition on an identical speaker. Returns ``(1, D)``."""
+    path = path or os.environ.get("VERL_TTS_SPK_EMBED")
+    if not path:
+        raise RuntimeError("VERL_TTS_SPK_EMBED must point to the precomputed clone x-vector JSON.")
+    import json
 
-    wav, sr = librosa.load(ref_audio_path, sr=None, mono=True)
-    assert int(sr) == 24000, f"ref audio must be 24 kHz, got {sr}"
-    mels = mel_spectrogram(
-        torch.from_numpy(wav.astype(np.float32)).unsqueeze(0),
-        n_fft=1024, num_mels=128, sampling_rate=24000, hop_size=256, win_size=1024, fmin=0, fmax=12000,
-    ).transpose(1, 2)
-    return mels  # (1, mel_t, 128)
+    with open(path) as f:
+        vec = json.load(f)
+    return torch.tensor(vec, dtype=torch.float32).reshape(1, -1)
 
 
 def _speaker_embedding(model, batch_size: int, device, dtype) -> torch.Tensor:
-    """Cached (B, H) speaker embedding from the fixed VERL_TTS_REF_AUDIO clip."""
+    """Cached ``(B, D)`` speaker x-vector for the talker's pos-6 slot."""
     cache = getattr(model, "_verl_tts_spk_cache", None)
     if cache is None:
-        ref = os.environ.get("VERL_TTS_REF_AUDIO")
-        if not ref:
-            raise RuntimeError("VERL_TTS_REF_AUDIO must point to the fixed clone ref wav (24 kHz).")
-        mel = _load_ref_mel(ref).to(device=device, dtype=dtype)
-        with torch.no_grad():
-            cache = model.speaker_encoder(mel).detach()  # (1, H)
+        cache = load_speaker_xvector()
         model._verl_tts_spk_cache = cache
-        logger.info("verl_omni.qwen3_tts: cached speaker embedding %s from %s", tuple(cache.shape), ref)
+        logger.info("verl_omni.qwen3_tts: loaded %d-dim speaker x-vector.", cache.shape[-1])
     return cache.to(device=device, dtype=dtype).expand(batch_size, -1)
 
 
@@ -125,6 +119,21 @@ def _qwen3_tts_get_input_embeddings(self):
 
 def _qwen3_tts_set_input_embeddings(self, value):
     self.talker.model.codec_embedding = value
+
+
+def _mirror_talker_config(config) -> None:
+    """verl's apply_monkey_patch (ulysses head check) + FSDP/MFU read standard transformer fields off
+    the TOP-LEVEL config, but Qwen3-TTS keeps them on ``talker_config`` (the trained backbone). Mirror
+    them up so the generic verl init path works on this composite config."""
+    tc = getattr(config, "talker_config", None)
+    if tc is None:
+        return
+    for attr in ("num_attention_heads", "num_key_value_heads", "hidden_size", "num_hidden_layers"):
+        try:
+            if getattr(config, attr, None) is None and getattr(tc, attr, None) is not None:
+                setattr(config, attr, getattr(tc, attr))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _apply_freeze(model) -> None:
@@ -189,6 +198,7 @@ def _register_qwen3_tts_automodel() -> None:
     def _post_init_with_freeze(self):
         if _orig_post_init is not None:
             _orig_post_init(self)
+        _mirror_talker_config(self.config)
         _apply_freeze(self)
 
     model_cls.post_init = _post_init_with_freeze
@@ -205,6 +215,15 @@ def _register_qwen3_tts_automodel() -> None:
         try:
             config_cls.tie_word_embeddings = _FalseTie()
         except Exception:  # noqa: BLE001
+            pass
+        # Register the custom model_type so verl's AutoConfig/AutoModelForCausalLM.from_pretrained
+        # recognize 'qwen3_tts' (the HF repo ships no modeling code / auto_map, and importing the
+        # qwen_tts package does NOT self-register — verified in-image).
+        try:
+            from transformers import AutoConfig
+
+            AutoConfig.register(getattr(config_cls, "model_type", "qwen3_tts"), config_cls)
+        except Exception:  # noqa: BLE001 — already registered
             pass
         try:
             AutoModelForCausalLM.register(config_cls, model_cls)

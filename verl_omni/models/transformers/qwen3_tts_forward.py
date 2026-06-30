@@ -45,6 +45,7 @@ total ``t = max(tl + cl) + 8``:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -198,7 +199,23 @@ def assemble_talker_embeddings(talker, batch: TalkerBatch, speaker_emb: torch.Te
     / ``.code_predictor.get_input_embeddings()``).
     """
     ids = batch.input_ids
-    te = talker.model.text_embedding(ids[:, :, 0]) * batch.text_embedding_mask
+    if os.environ.get("VERL_TTS_DEBUG"):
+        sub0 = talker.code_predictor.get_input_embeddings()[0]
+        print(
+            f"[tts-dev] text_emb={talker.model.text_embedding.weight.device} "
+            f"codec_emb={talker.model.codec_embedding.weight.device} "
+            f"sub0={sub0.weight.device} ids={ids.device} spk={speaker_emb.device}",
+            flush=True,
+        )
+    # vLLM-Omni generation runs every text-side embedding (incl. the tts_pad at the speaker slot)
+    # through talker.text_projection — a learned ResizeMLP, NOT identity (prompt_embeds_builder.py:
+    # 1280, 1236). whiplash's codec0_logprobs skips it (it never compares rollout-vs-actor, using
+    # old_logp=logp.detach()), but verl does, so the rollout is the on-policy oracle: apply it here.
+    te_raw = talker.model.text_embedding(ids[:, :, 0])
+    text_proj = getattr(talker, "text_projection", None)
+    if text_proj is not None:
+        te_raw = text_proj(te_raw)
+    te = te_raw * batch.text_embedding_mask
     ce = talker.model.codec_embedding(ids[:, :, 1]) * batch.codec_embedding_mask
     ce = ce.clone()
     ce[:, SPEAKER_SLOT, :] = speaker_emb.to(ce.dtype)
@@ -261,10 +278,41 @@ def tts_actor_logits(
 
     tokens = TalkerTokens.from_config(model.config)
     sub_vocab = int(talker.code_predictor.get_input_embeddings()[0].num_embeddings)
+
+    if os.environ.get("VERL_TTS_DEBUG"):
+        te_v = int(talker.model.text_embedding.num_embeddings)
+        ce_v = int(talker.model.codec_embedding.num_embeddings)
+        for i in range(b):
+            rl, tl, li = int(response_len[i]), int(text_len[i]), int(real_len[i])
+            ac, ti = audio_codes_list[i], text_ids_list[i]
+            print(
+                f"[tts-dbg] i={i} L={li} resp_len={rl} text_len={tl} rs={li - rl} "
+                f"codec0[min={int(ac[:, 0].min())},max={int(ac[:, 0].max())}] "
+                f"sub[min={int(ac[:, 1:].min())},max={int(ac[:, 1:].max())}] "
+                f"text[min={int(ti.min())},max={int(ti.max())}]",
+                flush=True,
+            )
+        print(f"[tts-dbg] vocab text_emb={te_v} codec_emb={ce_v} sub_emb={sub_vocab}", flush=True)
+
     batch = build_talker_batch(text_ids_list, audio_codes_list, tokens, device=device, sub_codebook_vocab=sub_vocab)
     whip_logits = codec0_logits(talker, batch, speaker_emb)
     vocab = whip_logits.shape[-1]
-    return realign_to_verl(whip_logits, batch, response_starts, (b, t_out, vocab))
+    # verl gathers log-probs over the FULL flat sequence (text prompt + codec response) before
+    # slicing the response, so out_logits must be wide enough for the text-prompt labels too (they
+    # are discarded downstream). Widen to cover max(codec vocab, any input id).
+    out_vocab = max(vocab, int(input_ids.max().item()) + 1)
+    if os.environ.get("VERL_TTS_DEBUG"):
+        for i in range(b):
+            rl, li = int(response_len[i]), int(real_len[i])
+            rs = li - rl
+            resp = input_ids[i, rs : rs + rl]
+            print(
+                f"[tts-dbg fwd] i={i} codec_head_vocab={vocab} "
+                f"verl_resp_codec0[min={int(resp.min())},max={int(resp.max())}] "
+                f"mm_codec0[max={int(audio_codes_list[i][:, 0].max())}] rs={rs} rl={rl}",
+                flush=True,
+            )
+    return realign_to_verl(whip_logits, batch, response_starts, (b, t_out, out_vocab))
 
 
 def realign_to_verl(
@@ -283,11 +331,16 @@ def realign_to_verl(
         out[i, rs-1 : rs-1+cl] = whip_logits[i, ls : ls+cl]
     Prompt/pad rows are left zero — verl drops them via ``response_mask``.
     """
-    b, T, vocab = out_shape
-    out = whip_logits.new_zeros((b, T, vocab))
+    b, T, out_vocab = out_shape
+    codec_vocab = whip_logits.shape[-1]
+    out = whip_logits.new_zeros((b, T, out_vocab))  # prompt/pad rows: finite 0 (their logprobs are discarded)
     for i in range(b):
         cl = batch.codec_lens[i]
         ls = batch.logit_start[i]
         rs = response_starts[i]
-        out[i, rs - 1 : rs - 1 + cl, :] = whip_logits[i, ls : ls + cl, :]
+        sl = slice(rs - 1, rs - 1 + cl)
+        if out_vocab > codec_vocab:
+            # response rows: mask the non-codec columns so codec-0 log_softmax is over the codec vocab only
+            out[i, sl, codec_vocab:] = -1e4
+        out[i, sl, :codec_vocab] = whip_logits[i, ls : ls + cl, :]
     return out

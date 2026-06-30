@@ -1,0 +1,48 @@
+# SMOKE stage config: single-stage AR talker only (1 GPU, tp=1). Emits codec tokens + the (T,16)
+# codes via multimodal_output (what the native actor forward consumes). No code2wav stage — audio
+# for the reward is decoded reward-side (or the reward degrades for this plumbing smoke). This
+# sidesteps the diffusion code2wav worker_type and runs the loop end-to-end on one H200.
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: talker
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      # Single-stage talker for RL rollout: codec output keeps it a generation model (avoids vllm's
+      # "does not support generation"), and the patched AR-runner rescue (deploy/patch_vllm_omni_ar_rescue.py
+      # extends gpu_ar_model_runner.py:199 to fire for "codec") runs the per-step postprocess so
+      # hidden_states['last'] feeds back into decode — no 2-stage connector (which deadlocks colocated).
+      engine_output_type: codec
+      hf_config_name: talker_config
+
+      tensor_parallel_size: 1
+      distributed_executor_backend: "mp"
+
+      gpu_memory_utilization: 0.28   # was 0.35; freed ~10GiB on the H200 for the reward-side
+                                     # code2wav decode + sim/mos models (1-GPU colocated smoke)
+      max_num_seqs: 64
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      enable_chunked_prefill: true
+
+      dtype: bfloat16
+      load_format: safetensors
+      trust_remote_code: true
+      enable_prefix_caching: false
+      enforce_eager: true
+
+      enable_sleep_mode: true
+      logprobs_mode: processed_logprobs
+      disable_log_stats: true
+
+      default_sampling_params:
+        temperature: 1.0
+        top_k: -1
+        top_p: 1.0
+        repetition_penalty: 1.0
+        max_tokens: 2048
+    final_output: true
+    final_output_type: codec

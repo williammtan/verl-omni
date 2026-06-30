@@ -31,6 +31,10 @@ data:
 actor_rollout_ref:
 
   model:
+    # Qwen3-TTS-Base has no chat_template; the agent-loop applies model.custom_chat_template to the
+    # rollout tokenizer (agent_loop.py:555-558). Passthrough = emit each message's content (the line
+    # to speak) verbatim, so apply_chat_template returns the raw TTS text.
+    custom_chat_template: "{% for message in messages %}{{ message['content'] }}{% endfor %}"
     override_config:
       attn_implementation: sdpa
     # Train ONLY the talker (codec_0 main path) + codec head; freeze sub-talker (codes 1-15),

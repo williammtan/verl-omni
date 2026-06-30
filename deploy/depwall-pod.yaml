@@ -1,0 +1,36 @@
+# Interactive single-GPU pod for the qwen-tts <-> vLLM-Omni dependency-wall experiment (angle A).
+# Base = verl-omni-tts:v4 (vllm 0.22 + vllm_omni 0.22 + torch cu130, transformers 5.x, hub>=1.0).
+# We downgrade transformers->4.57.3 + hub->0.36.2, shim the @strict validator, add qwen-tts, and
+# test: import vllm_omni + non-silent audio + trainable codec0 backward, all in one env.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: will-depwall
+  namespace: trainers
+  labels: {app: will-depwall}
+spec:
+  restartPolicy: Never
+  priorityClassName: skypilot-high-priority
+  nodeSelector: {nvidia.com/gpu.product: NVIDIA-H200}
+  containers:
+    - name: dev
+      image: williammtan/verl-omni-tts:v4
+      imagePullPolicy: IfNotPresent
+      workingDir: /workspace/verl-omni
+      env:
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+        - {name: HF_HOME, value: "/weka/whiplash-grpo/hf-cache"}
+        - {name: HUGGINGFACE_HUB_CACHE, value: "/weka/whiplash-grpo/hf-cache"}
+        - {name: MODELSCOPE_CACHE, value: "/weka/whiplash-grpo/modelscope-cache"}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: will-hf-token, key: HF_TOKEN}}}
+      command: ["/bin/bash", "-lc", "sleep infinity"]
+      resources:
+        requests: {cpu: "16", memory: 200Gi, nvidia.com/gpu: 1, ephemeral-storage: 20Gi}
+        limits: {nvidia.com/gpu: 1, memory: 400Gi, ephemeral-storage: 50Gi}
+      volumeMounts:
+        - {name: weka, mountPath: /weka}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - {name: weka, persistentVolumeClaim: {claimName: weka-data}}
+    - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
